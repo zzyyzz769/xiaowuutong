@@ -8,9 +8,11 @@ import json
 import re
 import secrets
 import sqlite3
+import tempfile
 import time
+import uuid
 import zipfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -91,7 +93,7 @@ class CampusRAG:
         data_dir: str = "data",
         db_dir: str = "chroma_db",
         system_db: str = "campus_system.db",
-        llm_model: str = "qwen2.5:3b",
+        llm_model: str = "qwen2.5:7b",
         embedding_model: str = "bge-m3",
         ollama_base_url: str = "http://localhost:11434",
         chunk_size: int = 500,
@@ -122,7 +124,7 @@ class CampusRAG:
             temperature=0.1,
             top_p=0.8,
             repeat_penalty=1.15,
-            num_predict=450,
+            num_predict=650,
         )
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -219,7 +221,9 @@ class CampusRAG:
                     feedback TEXT NOT NULL DEFAULT '',
                     feedback_at TEXT,
                     rerank_used INTEGER NOT NULL DEFAULT 0,
-                    resolved_question TEXT NOT NULL DEFAULT ''
+                    resolved_question TEXT NOT NULL DEFAULT '',
+                    trust_score INTEGER NOT NULL DEFAULT 0,
+                    trust_explanation TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS document_checks (
                     group_name TEXT NOT NULL,
@@ -240,6 +244,136 @@ class CampusRAG:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (group_name, filename)
                 );
+                CREATE TABLE IF NOT EXISTS document_governance (
+                    group_name TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    key_points_json TEXT NOT NULL DEFAULT '[]',
+                    detected_dates_json TEXT NOT NULL DEFAULT '[]',
+                    conflicts_json TEXT NOT NULL DEFAULT '[]',
+                    analysis_notice TEXT NOT NULL DEFAULT '',
+                    analyzed_at TEXT NOT NULL,
+                    PRIMARY KEY (group_name, filename)
+                );
+                CREATE TABLE IF NOT EXISTS forum_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    image_path TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'visible',
+                    moderation_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS forum_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    post_id INTEGER NOT NULL,
+                    parent_id INTEGER,
+                    username TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'visible',
+                    moderation_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS forum_reactions (
+                    username TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    reaction TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (username, target_type, target_id, reaction)
+                );
+                CREATE TABLE IF NOT EXISTS lost_found_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    location TEXT NOT NULL,
+                    happened_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS market_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    description TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    risk_status TEXT NOT NULL DEFAULT 'visible',
+                    risk_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS schedule_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    course_name TEXT NOT NULL,
+                    weekday INTEGER NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    location TEXT NOT NULL DEFAULT '',
+                    teacher TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS activities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    location TEXT NOT NULL,
+                    starts_at TEXT NOT NULL,
+                    ends_at TEXT NOT NULL,
+                    capacity INTEGER NOT NULL,
+                    created_by TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'published',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS activity_enrollments (
+                    activity_id INTEGER NOT NULL,
+                    username TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (activity_id, username)
+                );
+                CREATE TABLE IF NOT EXISTS study_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    grade TEXT NOT NULL,
+                    major TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    plan_text TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mood_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'visible',
+                    moderation_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mood_checkins (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    mood_score INTEGER NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    response TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS private_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sender TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'delivered',
+                    moderation_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    read_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS evaluation_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL,
@@ -258,6 +392,12 @@ class CampusRAG:
                     ON audit_logs(role, created_at);
                 CREATE INDEX IF NOT EXISTS idx_qa_user
                     ON qa_records(username, created_at);
+                CREATE INDEX IF NOT EXISTS idx_forum_posts_created
+                    ON forum_posts(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_private_messages_users
+                    ON private_messages(sender, recipient, created_at);
+                CREATE INDEX IF NOT EXISTS idx_schedule_user_day
+                    ON schedule_entries(username, weekday);
                 """
             )
 
@@ -272,6 +412,8 @@ class CampusRAG:
                 "feedback_at": "TEXT",
                 "rerank_used": "INTEGER NOT NULL DEFAULT 0",
                 "resolved_question": "TEXT NOT NULL DEFAULT ''",
+                "trust_score": "INTEGER NOT NULL DEFAULT 0",
+                "trust_explanation": "TEXT NOT NULL DEFAULT ''",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -669,6 +811,10 @@ class CampusRAG:
             )
             conn.execute(
                 "DELETE FROM document_meta WHERE group_name = ? AND filename = ?",
+                (group, path.name),
+            )
+            conn.execute(
+                "DELETE FROM document_governance WHERE group_name = ? AND filename = ?",
                 (group, path.name),
             )
         self._audit(
@@ -1148,6 +1294,43 @@ class CampusRAG:
             pass
         return f"{previous}；追问：{question}"
 
+    def _answer_trust(
+        self, sources: list[dict[str, Any]], retrieval_confidence: int
+    ) -> tuple[int, str]:
+        """回答参考可信度：检索匹配、版本有效性和独立资料印证的组合指标。"""
+        if not sources:
+            return 0, "没有找到可直接使用的资料，因此不计算回答可信度。"
+        current_ratio = sum(bool(s.get("is_current", True)) for s in sources) / len(sources)
+        unique_docs = {s.get("source") for s in sources}
+        corroborated = False
+        for i, left in enumerate(sources):
+            left_tokens = set(self._tokens(str(left.get("evidence", ""))))
+            for right in sources[i + 1:]:
+                if left.get("source") == right.get("source"):
+                    continue
+                right_tokens = set(self._tokens(str(right.get("evidence", ""))))
+                union = left_tokens | right_tokens
+                overlap = len(left_tokens & right_tokens)
+                if union and overlap >= 3 and overlap / len(union) >= 0.12:
+                    corroborated = True
+                    break
+            if corroborated:
+                break
+        support = 100 if corroborated else (40 if len(unique_docs) > 1 else 0)
+        score = round(
+            0.55 * max(0, min(100, retrieval_confidence))
+            + 0.25 * 100 * current_ratio + 0.20 * support
+        )
+        notes = [f"资料匹配 {retrieval_confidence}/100"]
+        notes.append("来源均为现行版本" if current_ratio == 1 else "包含旧版或未生效资料")
+        if corroborated:
+            notes.append("不同文档的关键内容有一定重合")
+        elif len(unique_docs) > 1:
+            notes.append("有多份文档，但内容尚不足以视为相互印证")
+        else:
+            notes.append("目前只有一份文档支持")
+        return max(0, min(100, score)), "；".join(notes)
+
     def ask(
         self,
         actor: dict[str, str],
@@ -1262,14 +1445,15 @@ class CampusRAG:
             confidence = round(0.6 * max(values) + 0.4 * sum(values) / len(values))
 
         sources_json = json.dumps(sources, ensure_ascii=False)
+        trust_score, trust_explanation = self._answer_trust(sources, confidence)
         with self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO qa_records (created_at, username, role, question, answer,"
-                " sources_json, confidence, model, retrieval_mode, rerank_used, resolved_question)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " sources_json, confidence, model, retrieval_mode, rerank_used, resolved_question,"
+                " trust_score, trust_explanation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (self._now(), actor["username"], actor["role"], question, answer,
                  sources_json, confidence, self.llm_model, retrieval_mode, int(use_rerank),
-                 resolved_question),
+                 resolved_question, trust_score, trust_explanation),
             )
             record_id = int(cursor.lastrowid)
         self._audit(
@@ -1284,11 +1468,185 @@ class CampusRAG:
         return {
             "answer": answer, "sources": sources, "record_id": record_id,
             "confidence": confidence, "model": self.llm_model,
+            "trust_score": trust_score, "trust_explanation": trust_explanation,
             "retrieval_mode": retrieval_mode, "rerank_used": use_rerank,
             "resolved_question": resolved_question,
             "rerank_notice": rerank_notice,
             "generation_notice": generation_notice,
         }
+
+    # ---------- 引导式事务办理 ----------
+
+    @staticmethod
+    def _guide_sentences(source: dict[str, Any]) -> list[str]:
+        text = re.sub(r"[ \t]+", " ", str(source.get("content", "")))
+        return [
+            part.strip() for part in re.split(r"(?<=[。！？；])|\n+", text)
+            if 4 <= len(part.strip()) <= 500
+        ]
+
+    def build_transaction_guide(
+        self,
+        actor: dict[str, str],
+        topic: str,
+        top_k: int = 6,
+        retrieval_mode: str = "hybrid",
+        use_rerank: bool = False,
+    ) -> dict[str, Any]:
+        """从真实检索结果归类办理信息；任何类别没有原文依据时保持为空。"""
+        self._role(actor)
+        topic = topic.strip()
+        if not topic:
+            raise ValueError("请先填写要办理的事项。")
+        if len(topic) > MAX_QUESTION_LENGTH:
+            raise ValueError("事项说明过长，请控制在 500 字以内。")
+        retrieval = self.retrieve(
+            actor, topic, top_k=min(6, max(3, top_k)),
+            retrieval_mode=retrieval_mode, use_rerank=use_rerank,
+        )
+        entries = retrieval["entries"]
+        if not entries:
+            return {
+                "found": False, "topic": topic, "sections": {}, "sources": [],
+                "missing": ["条件", "材料", "办理步骤", "截止信息"],
+                "message": "当前可访问的资料中没有找到这项事务的规定，请更换表述或联系管理员补充制度。",
+                "rerank_notice": retrieval["rerank_notice"],
+            }
+
+        metadata_map = self._document_meta_map()
+        sources: list[dict[str, Any]] = []
+        for index, entry in enumerate(entries, start=1):
+            doc = entry["doc"]
+            group = str(doc.metadata["group"])
+            meta = metadata_map.get((group, doc.metadata["source"]), {})
+            evidence, highlight, matched = self._evidence(doc, topic)
+            sources.append({
+                "id": index, "group": group, "group_name": GROUPS[group],
+                "source": doc.metadata["source"], "page": doc.metadata.get("page"),
+                "chunk": doc.metadata.get("chunk"), "content": doc.page_content.strip(),
+                "evidence": evidence, "highlight": highlight, "matched": matched,
+                "confidence": entry["confidence"],
+                "academic_year": meta.get("academic_year", ""),
+                "effective_date": meta.get("effective_date", ""),
+                "expiry_date": meta.get("expiry_date", ""),
+                "is_current": meta.get("is_current", True),
+                "status": meta.get("status", "现行有效"),
+                "replaces": meta.get("replaces", ""),
+            })
+
+        category_rules = {
+            "conditions": (
+                "条件", ("条件", "资格", "符合", "情形", "对象", "范围", "方可", "可以申请", "应当具备"),
+            ),
+            "materials": (
+                "材料", ("材料", "申请表", "证明", "证件", "附件", "提交以下", "原件及复印件"),
+            ),
+            "steps": (
+                "办理步骤", ("流程", "步骤", "提出申请", "提交", "审核", "审批", "办理", "公示", "备案"),
+            ),
+            "deadlines": (
+                "截止信息", ("截止", "日前", "之内", "工作日", "期限", "时间安排", "逾期", "学年内"),
+            ),
+        }
+        sections: dict[str, list[dict[str, Any]]] = {}
+        missing = []
+        for key, (label, keywords) in category_rules.items():
+            candidates = []
+            for source in sources:
+                for position, sentence in enumerate(self._guide_sentences(source)):
+                    compact = re.sub(r"\s+", "", sentence)
+                    hits = sum(1 for word in keywords if word in compact)
+                    if not hits:
+                        continue
+                    # 日期本身也是截止信息；其他类别必须出现明确的类别提示词。
+                    if key == "deadlines":
+                        hits += len(re.findall(
+                            r"(?:20\d{2}[年/-]\d{1,2}(?:[月/-]\d{1,2}日?)?|\d+\s*个工作日)", compact
+                        ))
+                    relevance = sum(1 for token in set(self._tokens(topic)) if token in compact)
+                    candidates.append({
+                        "text": sentence[:300], "source_ids": [source["id"]],
+                        "_score": hits * 4 + relevance, "_source": source["id"],
+                        "_position": position,
+                    })
+            candidates.sort(key=lambda item: (-item["_score"], item["_source"], item["_position"]))
+            selected = []
+            seen = set()
+            for item in candidates:
+                normalized = re.sub(r"[\s，。；、]", "", item["text"])
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                selected.append(item)
+                if len(selected) >= (5 if key == "steps" else 4):
+                    break
+            if key == "steps":
+                selected.sort(key=lambda item: (item["_source"], item["_position"]))
+            for item in selected:
+                item.pop("_score", None)
+                item.pop("_source", None)
+                item.pop("_position", None)
+            sections[key] = selected
+            if not selected:
+                missing.append(label)
+
+        values = [int(s["confidence"]) for s in sources]
+        confidence = round(0.6 * max(values) + 0.4 * sum(values) / len(values))
+        trust_score, trust_explanation = self._answer_trust(sources, confidence)
+        message = (
+            "已从资料中整理出办理信息，请逐项核对来源。"
+            if not missing else "资料中没有明确写出：" + "、".join(missing) + "；这些部分不会自动编造。"
+        )
+        self._audit(
+            actor["username"], actor["role"], "transaction_guide", topic[:200],
+            f"命中 {len(sources)} 条来源；缺少：{'、'.join(missing) or '无'}",
+        )
+        return {
+            "found": True, "topic": topic, "sections": sections, "sources": sources,
+            "missing": missing, "message": message, "confidence": confidence,
+            "trust_score": trust_score, "trust_explanation": trust_explanation,
+            "created_at": self._now(), "rerank_notice": retrieval["rerank_notice"],
+            "rerank_used": retrieval["rerank_used"],
+        }
+
+    def export_transaction_guide(
+        self, actor: dict[str, str], guide: dict[str, Any], checked_materials: list[int]
+    ) -> bytes:
+        """导出当前向导和用户勾选状态，不接收任意文件路径或外部内容。"""
+        allowed = self._allowed_groups(actor)
+        for source in guide.get("sources", []):
+            if source.get("group") not in allowed:
+                raise PermissionError("当前角色无权导出该向导中的来源。")
+        checked = {int(value) for value in checked_materials}
+        lines = [
+            "校务通事务办理清单",
+            f"事项：{guide.get('topic', '')}",
+            f"生成时间：{guide.get('created_at', self._now())}",
+            "",
+        ]
+        labels = {"conditions": "一、办理条件", "materials": "二、材料清单",
+                  "steps": "三、办理步骤", "deadlines": "四、截止信息"}
+        for key, title in labels.items():
+            lines.append(title)
+            items = guide.get("sections", {}).get(key, [])
+            if not items:
+                lines.append("资料中未明确说明，请向负责部门核实。")
+            for index, item in enumerate(items, start=1):
+                refs = "、".join(f"资料{value}" for value in item.get("source_ids", []))
+                prefix = f"[{'已勾选' if index - 1 in checked else '未勾选'}] " if key == "materials" else f"{index}. "
+                lines.append(f"{prefix}{item.get('text', '')}（{refs}）")
+            lines.append("")
+        lines.append("五、原文来源")
+        for source in guide.get("sources", []):
+            page = f"，第 {source['page']} 页" if source.get("page") else ""
+            lines.append(
+                f"[资料{source['id']}] {source['group_name']}/{source['source']}{page}"
+                f"，{source.get('status', '现行有效')}"
+            )
+        lines.extend(["", "提示：本清单只整理所引资料，不替代负责部门的最终审核。"])
+        self._audit(actor["username"], actor["role"], "export_guide", str(guide.get("topic", ""))[:200])
+        content = "\n".join(lines) + self._watermark(actor["username"])
+        return ("\ufeff" + content).encode("utf-8")
 
     def evaluate_retrieval(
         self,
@@ -1541,6 +1899,1362 @@ class CampusRAG:
         )
         return {"text": text, "location": location}
 
+    # ---------- 文档摘要、时间识别与新旧规定治理 ----------
+
+    @staticmethod
+    def _governance_sentences(documents: list[Document]) -> list[dict[str, Any]]:
+        result = []
+        for doc in documents:
+            text = re.sub(r"[ \t]+", " ", doc.page_content.strip())
+            for part in re.split(r"(?<=[。！？；])|\n+", text):
+                sentence = part.strip()
+                if 6 <= len(sentence) <= 500:
+                    result.append({"text": sentence, "page": doc.metadata.get("page")})
+        return result
+
+    @staticmethod
+    def _numeric_signature(text: str) -> tuple[str, ...]:
+        values = re.findall(
+            r"(?<![A-Za-z])\d+(?:\.\d+)?\s*(?:%|％|个?工作日|个?自然日|日|天|学分|元|次|个月|年)?",
+            text,
+        )
+        return tuple(dict.fromkeys(re.sub(r"\s+", "", value) for value in values))
+
+    def _detect_document_conflicts(
+        self,
+        group: str,
+        filename: str,
+        documents: list[Document],
+    ) -> list[dict[str, Any]]:
+        """只报告附有双方原文的疑点，不把模型判断当成制度冲突结论。"""
+        all_docs = self.list_documents({"username": "governance", "role": "admin"})
+        metadata_map = self._document_meta_map()
+        current_meta = metadata_map.get((group, filename), {})
+        current_sentences = self._governance_sentences(documents)
+        current_text = "\n".join(item["text"] for item in current_sentences)
+        current_topics = {key for key in QUERY_EXPANSIONS if key in current_text}
+        conflicts: list[dict[str, Any]] = []
+        seen_pairs = set()
+
+        for other in all_docs:
+            if other["group"] == group and other["filename"] == filename:
+                continue
+            other_meta = metadata_map.get((other["group"], other["filename"]), {})
+            replace_text = str(current_meta.get("replaces", "")) + str(other_meta.get("replaces", ""))
+            explicitly_linked = other["filename"] in replace_text or filename in replace_text
+            try:
+                other_documents = self._load_file(other["group"], other["filename"], use_ocr=False)
+            except Exception:
+                continue
+            other_sentences = self._governance_sentences(other_documents)
+            other_text = "\n".join(item["text"] for item in other_sentences)
+            shared_topics = current_topics & {key for key in QUERY_EXPANSIONS if key in other_text}
+            if not explicitly_linked and not shared_topics:
+                continue
+
+            pair_key = (other["group"], other["filename"], "status")
+            if (
+                explicitly_linked and current_meta.get("is_current", True)
+                and other_meta.get("is_current", True) and pair_key not in seen_pairs
+            ):
+                conflicts.append({
+                    "reason": "两份存在替代关系的文件都被标为现行，需要人工确认当前使用版本。",
+                    "current_excerpt": current_sentences[0]["text"][:300] if current_sentences else "",
+                    "current_page": current_sentences[0].get("page") if current_sentences else None,
+                    "other_group": other["group"], "other_filename": other["filename"],
+                    "other_group_name": GROUPS[other["group"]],
+                    "other_excerpt": other_sentences[0]["text"][:300] if other_sentences else "",
+                    "other_page": other_sentences[0].get("page") if other_sentences else None,
+                })
+                seen_pairs.add(pair_key)
+
+            # 只有同一事项且双方都有数字表述时才提示，避免把无关数字误判为冲突。
+            numeric_current = [s for s in current_sentences if self._numeric_signature(s["text"])]
+            numeric_other = [s for s in other_sentences if self._numeric_signature(s["text"])]
+            for left in numeric_current[:100]:
+                left_tokens = set(self._tokens(left["text"]))
+                left_numbers = self._numeric_signature(left["text"])
+                for right in numeric_other[:100]:
+                    right_numbers = self._numeric_signature(right["text"])
+                    if left_numbers == right_numbers:
+                        continue
+                    right_tokens = set(self._tokens(right["text"]))
+                    shared = left_tokens & right_tokens
+                    sentence_topics = {
+                        key for key in shared_topics
+                        if key in left["text"] and key in right["text"]
+                    }
+                    if not sentence_topics and len(shared) < 4:
+                        continue
+                    pair_key = (other["group"], other["filename"], left["text"], right["text"])
+                    if pair_key in seen_pairs:
+                        continue
+                    conflicts.append({
+                        "reason": "同一事项的数字、比例或期限表述不同，需要人工核对适用范围和版本。",
+                        "current_values": list(left_numbers), "other_values": list(right_numbers),
+                        "current_excerpt": left["text"][:300], "current_page": left.get("page"),
+                        "other_group": other["group"], "other_filename": other["filename"],
+                        "other_group_name": GROUPS[other["group"]],
+                        "other_excerpt": right["text"][:300], "other_page": right.get("page"),
+                    })
+                    seen_pairs.add(pair_key)
+                    if len(conflicts) >= 8:
+                        return conflicts
+        return conflicts
+
+    def analyze_document_governance(
+        self, actor: dict[str, str], group: str, filename: str, use_ocr: bool = False
+    ) -> dict[str, Any]:
+        self._require_admin(actor)
+        if group not in GROUPS:
+            raise ValueError("未知文档分组。")
+        filename = self._safe_filename(filename)
+        documents = self._load_file(group, filename, use_ocr=use_ocr)
+        sentences = self._governance_sentences(documents)
+        full_text = "\n".join(doc.page_content for doc in documents)
+        notices = []
+        if len(full_text) > 24000:
+            notices.append("文档较长，智能摘要只阅读了前 24000 字；日期和冲突检查仍使用全文。")
+        prompt = f"""请只根据下面的制度原文写一份简明说明，不补充原文没有的内容。
+第一行写“摘要：”，用100字以内说明这份文件管什么事、适用于谁。
+然后写“关键点：”，列出3至5条原文中的条件、材料、流程或期限；每条一行，不超过70字。
+不要写建议，不要评价，不要虚构日期或数字。
+
+原文：
+{full_text[:24000]}
+"""
+        raw = ""
+        try:
+            raw = str(self.llm.invoke(prompt)).strip()
+        except Exception as exc:
+            notices.append(f"本地模型暂时不可用，摘要已改为原文摘录：{exc}")
+        summary_match = re.search(r"摘要[:：]\s*(.+)", raw)
+        summary = summary_match.group(1).strip()[:220] if summary_match else ""
+        key_points = []
+        if "关键点" in raw:
+            point_text = raw.split("关键点", 1)[1]
+            for line in point_text.splitlines():
+                point = re.sub(r"^\s*(?:关键点[:：])?\s*(?:\d+[.、)]|[-•])\s*", "", line).strip()
+                if point and "摘要" not in point and len(point) >= 6:
+                    key_points.append(point[:180])
+                if len(key_points) >= 5:
+                    break
+        if not summary:
+            summary = next((s["text"][:220] for s in sentences if len(s["text"]) >= 20), "未生成摘要，请查看原文。")
+            if not notices:
+                notices.append("模型摘要格式不完整，当前显示原文摘录。")
+        if not key_points:
+            key_points = [s["text"][:180] for s in sentences[:4]]
+            if not notices:
+                notices.append("关键点当前为原文摘录，请结合全文核对。")
+
+        detected_dates = []
+        seen_dates = set()
+        date_pattern = re.compile(
+            r"(?:20\d{2}\s*年\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?|"
+            r"20\d{2}[-/.]\d{1,2}(?:[-/.]\d{1,2})?|"
+            r"\d{1,2}\s*月\s*\d{1,2}\s*日|\d+\s*个工作日)"
+        )
+        for sentence in sentences:
+            for match in date_pattern.finditer(sentence["text"]):
+                value = re.sub(r"\s+", "", match.group(0))
+                key = (value, sentence["text"])
+                if key in seen_dates:
+                    continue
+                seen_dates.add(key)
+                detected_dates.append({
+                    "date": value, "context": sentence["text"][:300], "page": sentence.get("page")
+                })
+                if len(detected_dates) >= 40:
+                    break
+            if len(detected_dates) >= 40:
+                break
+        conflicts = self._detect_document_conflicts(group, filename, documents)
+        analyzed_at = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO document_governance (group_name, filename, summary,"
+                " key_points_json, detected_dates_json, conflicts_json, analysis_notice, analyzed_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (group, filename, summary, json.dumps(key_points, ensure_ascii=False),
+                 json.dumps(detected_dates, ensure_ascii=False),
+                 json.dumps(conflicts, ensure_ascii=False),
+                 "\n".join(notices), analyzed_at),
+            )
+        self._audit(
+            actor["username"], actor["role"], "governance_analysis", f"{group}/{filename}",
+            f"关键点 {len(key_points)} 条；时间 {len(detected_dates)} 处；待核对疑点 {len(conflicts)} 条",
+        )
+        return self.get_document_governance(actor, group, filename) or {}
+
+    def get_document_governance(
+        self, actor: dict[str, str], group: str, filename: str
+    ) -> dict[str, Any] | None:
+        if group not in self._allowed_groups(actor):
+            raise PermissionError("当前角色无权查看该文档的治理信息。")
+        filename = self._safe_filename(filename)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM document_governance WHERE group_name = ? AND filename = ?",
+                (group, filename),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "group": row["group_name"], "filename": row["filename"],
+            "summary": row["summary"],
+            "key_points": json.loads(row["key_points_json"] or "[]"),
+            "detected_dates": json.loads(row["detected_dates_json"] or "[]"),
+            "conflicts": json.loads(row["conflicts_json"] or "[]"),
+            "analysis_notice": row["analysis_notice"], "analyzed_at": row["analyzed_at"],
+        }
+
+    # ---------- 校园社区：通用审核、论坛与内容风控 ----------
+
+    @staticmethod
+    def _community_text(value: Any, label: str, limit: int, required: bool = True) -> str:
+        text = re.sub(r"\r\n?|\x00", "\n", str(value or "")).strip()
+        if required and not text:
+            raise ValueError(f"请填写{label}。")
+        if len(text) > limit:
+            raise ValueError(f"{label}不能超过 {limit} 字。")
+        return text
+
+    def _moderate_content(self, text: str, use_ai: bool = True) -> dict[str, Any]:
+        """规则兜底＋本地模型辅助审核；模型只能提高风险等级，不能放过规则命中。"""
+        compact = re.sub(r"\s+", "", text).lower()
+        hard_patterns = {
+            "疑似诈骗或刷单": r"刷单兼职|兼职日结|先交保证金|解冻资金|稳赚不赔|代抢课收费",
+            "严重辱骂或攻击": r"傻逼|弱智废物|去死吧|nmsl",
+            "赌博或色情引流": r"博彩下注|赌场网址|裸聊|色情服务",
+        }
+        soft_patterns = {
+            "包含站外联系方式或引流": r"加我微信|微信群|qq群|扣扣| telegram|whatsapp",
+            "包含链接，需要人工确认用途": r"https?://|www\.",
+            "包含手机号，请注意个人信息": r"(?<!\d)1[3-9]\d{9}(?!\d)",
+        }
+        hard_hits = [label for label, pattern in hard_patterns.items() if re.search(pattern, compact, re.I)]
+        soft_hits = [label for label, pattern in soft_patterns.items() if re.search(pattern, compact, re.I)]
+        rule_status = "blocked" if hard_hits else ("review" if soft_hits else "visible")
+        reasons = hard_hits + soft_hits
+        status = rule_status
+        ai_used = False
+        notice = ""
+        if use_ai:
+            prompt = f"""你是校园内容安全审核员。只根据文本判断风险，不评价观点是否讨喜。
+第一行只能输出“通过”“复核”或“拦截”。
+第二行用20字以内说明原因。广告、诈骗、严重辱骂、色情赌博和校外引流需要复核或拦截；正常求助、课程讨论和批评意见应通过。
+文本：{text[:3000]}
+"""
+            try:
+                raw = str(self.llm.invoke(prompt)).strip()
+                first = raw.splitlines()[0] if raw else ""
+                ai_status = ""
+                if re.search(r"^(?:审核结果[:：]\s*)?拦截", first):
+                    ai_status = "blocked"
+                elif re.search(r"^(?:审核结果[:：]\s*)?复核", first):
+                    ai_status = "review"
+                elif re.search(r"^(?:审核结果[:：]\s*)?通过", first):
+                    ai_status = "visible"
+                if ai_status:
+                    ai_used = True
+                    rank = {"visible": 0, "review": 1, "blocked": 2}
+                    if rank[ai_status] > rank[status]:
+                        status = ai_status
+                    if len(raw.splitlines()) > 1 and raw.splitlines()[1].strip():
+                        reasons.append("本地审核：" + raw.splitlines()[1].strip()[:100])
+                else:
+                    notice = "本地审核返回格式不完整，已使用规则结果。"
+            except Exception as exc:
+                notice = f"本地 AI 审核暂不可用，已使用规则结果：{exc}"
+        return {
+            "status": status, "reason": "；".join(dict.fromkeys(reasons)),
+            "ai_used": ai_used, "notice": notice,
+        }
+
+    def _save_community_image(self, content: bytes | None, extension: str) -> str:
+        if not content:
+            return ""
+        if len(content) > 5 * 1024 * 1024:
+            raise ValueError("图片不能超过 5 MB。")
+        ext = extension.lower()
+        if ext not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ValueError("仅支持 PNG、JPG、JPEG 和 WebP 图片。")
+        folder = self.data_dir / "community_images"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{uuid.uuid4().hex}{ext}"
+        path.write_bytes(content)
+        return str(path)
+
+    def list_user_directory(self, actor: dict[str, str]) -> list[dict[str, str]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT username, role FROM users WHERE username != ? ORDER BY role, username",
+                (actor["username"],),
+            ).fetchall()
+        return [{"username": row["username"], "role": row["role"],
+                 "role_name": ROLE_NAMES.get(row["role"], row["role"])} for row in rows]
+
+    def create_forum_post(
+        self, actor: dict[str, str], category: str, title: str, content: str,
+        image_content: bytes | None = None, image_extension: str = "",
+    ) -> dict[str, Any]:
+        role = self._role(actor)
+        categories = {"求助", "选课交流", "组队", "吐槽", "校园生活", "其他"}
+        if category not in categories:
+            raise ValueError("未知帖子分类。")
+        title = self._community_text(title, "标题", 80)
+        content = self._community_text(content, "正文", 5000)
+        image_path = self._save_community_image(image_content, image_extension)
+        moderation = self._moderate_content(title + "\n" + content)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO forum_posts (username, role, category, title, content, image_path,"
+                " status, moderation_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (actor["username"], role, category, title, content, image_path,
+                 moderation["status"], moderation["reason"], self._now()),
+            )
+            post_id = int(cursor.lastrowid)
+        self._audit(actor["username"], role, "forum_post", str(post_id), moderation["status"])
+        return {"id": post_id, **moderation}
+
+    def get_forum_posts(
+        self, actor: dict[str, str], category: str = "全部", sort: str = "latest"
+    ) -> list[dict[str, Any]]:
+        self._role(actor)
+        where = "(p.status = 'visible' OR p.username = ?)"
+        if category != "全部":
+            where += " AND p.category = ?"
+        order = "p.created_at DESC"
+        if sort == "hot":
+            order = "like_count DESC, comment_count DESC, p.created_at DESC"
+        elif sort == "favorite":
+            where += " AND EXISTS (SELECT 1 FROM forum_reactions fr WHERE fr.target_type = 'post'"
+            where += " AND fr.target_id = p.id AND fr.reaction = 'favorite' AND fr.username = ?)"
+        sql = f"""
+            SELECT p.*,
+              (SELECT COUNT(*) FROM forum_reactions r WHERE r.target_type='post'
+               AND r.target_id=p.id AND r.reaction='like') AS like_count,
+              (SELECT COUNT(*) FROM forum_comments c WHERE c.post_id=p.id AND c.status='visible') AS comment_count,
+              EXISTS(SELECT 1 FROM forum_reactions r WHERE r.target_type='post'
+               AND r.target_id=p.id AND r.reaction='like' AND r.username=?) AS liked,
+              EXISTS(SELECT 1 FROM forum_reactions r WHERE r.target_type='post'
+               AND r.target_id=p.id AND r.reaction='favorite' AND r.username=?) AS favorited
+            FROM forum_posts p WHERE {where} ORDER BY {order} LIMIT ?
+        """
+        # 前三位参数分别对应当前用户可见性、点赞状态和收藏状态；按 SQL 出现顺序重新排列。
+        ordered_params: list[Any] = [actor["username"], actor["username"]]
+        if category != "全部":
+            ordered_params.append(category)
+        if sort == "favorite":
+            ordered_params.append(actor["username"])
+        ordered_params.insert(0, actor["username"])
+        ordered_params.append(200)
+        with self._connect() as conn:
+            rows = conn.execute(sql, ordered_params).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_forum_comment(
+        self, actor: dict[str, str], post_id: int, content: str, parent_id: int | None = None
+    ) -> dict[str, Any]:
+        self._role(actor)
+        content = self._community_text(content, "评论", 1500)
+        with self._connect() as conn:
+            post = conn.execute(
+                "SELECT id FROM forum_posts WHERE id = ? AND status = 'visible'", (post_id,)
+            ).fetchone()
+            if not post:
+                raise ValueError("帖子不存在或暂不可评论。")
+            if parent_id is not None:
+                parent = conn.execute(
+                    "SELECT id FROM forum_comments WHERE id = ? AND post_id = ? AND status = 'visible'",
+                    (parent_id, post_id),
+                ).fetchone()
+                if not parent:
+                    raise ValueError("要回复的评论不存在。")
+        moderation = self._moderate_content(content)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO forum_comments (post_id, parent_id, username, content, status,"
+                " moderation_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (post_id, parent_id, actor["username"], content, moderation["status"],
+                 moderation["reason"], self._now()),
+            )
+            comment_id = int(cursor.lastrowid)
+        self._audit(actor["username"], actor["role"], "forum_comment", str(comment_id), moderation["status"])
+        return {"id": comment_id, **moderation}
+
+    def get_forum_comments(self, actor: dict[str, str], post_id: int) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, post_id, parent_id, username, content, created_at FROM forum_comments"
+                " WHERE post_id = ? AND status = 'visible' ORDER BY id ASC LIMIT 500", (post_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def toggle_forum_reaction(
+        self, actor: dict[str, str], post_id: int, reaction: str
+    ) -> bool:
+        self._role(actor)
+        if reaction not in {"like", "favorite"}:
+            raise ValueError("未知操作。")
+        with self._connect() as conn:
+            if not conn.execute("SELECT 1 FROM forum_posts WHERE id = ? AND status='visible'", (post_id,)).fetchone():
+                raise ValueError("帖子不存在。")
+            exists = conn.execute(
+                "SELECT 1 FROM forum_reactions WHERE username=? AND target_type='post'"
+                " AND target_id=? AND reaction=?", (actor["username"], post_id, reaction)
+            ).fetchone()
+            if exists:
+                conn.execute(
+                    "DELETE FROM forum_reactions WHERE username=? AND target_type='post'"
+                    " AND target_id=? AND reaction=?", (actor["username"], post_id, reaction)
+                )
+                active = False
+            else:
+                conn.execute(
+                    "INSERT INTO forum_reactions VALUES (?, 'post', ?, ?, ?)",
+                    (actor["username"], post_id, reaction, self._now()),
+                )
+                active = True
+        return active
+
+    def get_moderation_queue(self, actor: dict[str, str]) -> list[dict[str, Any]]:
+        self._require_admin(actor)
+        result = []
+        sources = [
+            ("forum_posts", "status", "帖子", "title || '：' || content", "username"),
+            ("forum_comments", "status", "评论", "content", "username"),
+            ("market_items", "risk_status", "二手商品", "title || '：' || description", "username"),
+            ("mood_posts", "status", "树洞", "content", "username"),
+            ("private_messages", "status", "私信", "content", "sender"),
+        ]
+        with self._connect() as conn:
+            for table, field, kind, content_sql, user_field in sources:
+                condition = "<> 'delivered'" if table == "private_messages" else "<> 'visible'"
+                reason_field = "moderation_reason" if table in {"forum_posts", "forum_comments", "mood_posts", "private_messages"} else "risk_reason"
+                rows = conn.execute(
+                    f"SELECT id, {user_field} AS author, {content_sql} AS content,"
+                    f" {field} AS status, {reason_field} AS reason, created_at"
+                    f" FROM {table} WHERE {field} {condition} ORDER BY id DESC LIMIT 30"
+                ).fetchall()
+                for row in rows:
+                    result.append({"type": kind, "table": table, **dict(row)})
+        return sorted(result, key=lambda item: item["created_at"], reverse=True)[:150]
+
+    def review_moderation_item(
+        self, actor: dict[str, str], table: str, item_id: int, approve: bool
+    ) -> None:
+        self._require_admin(actor)
+        settings = {
+            "forum_posts": ("status", "visible", "hidden"),
+            "forum_comments": ("status", "visible", "hidden"),
+            "market_items": ("risk_status", "visible", "hidden"),
+            "mood_posts": ("status", "visible", "hidden"),
+            "private_messages": ("status", "delivered", "blocked"),
+        }
+        if table not in settings:
+            raise ValueError("不支持的审核对象。")
+        field, approved, rejected = settings[table]
+        value = approved if approve else rejected
+        with self._connect() as conn:
+            cursor = conn.execute(f"UPDATE {table} SET {field}=? WHERE id=?", (value, item_id))
+        if cursor.rowcount == 0:
+            raise ValueError("审核对象不存在。")
+        self._audit(actor["username"], actor["role"], "moderation_review", f"{table}/{item_id}", value)
+
+    # ---------- 失物招领、二手交易与站内私信 ----------
+
+    def create_lost_found_item(
+        self, actor: dict[str, str], kind: str, category: str, title: str,
+        description: str, location: str, happened_at: str,
+    ) -> int:
+        self._role(actor)
+        if kind not in {"lost", "found"}:
+            raise ValueError("请选择“丢失”或“捡到”。")
+        if category not in {"校园卡", "书籍", "雨伞", "电子产品", "证件钥匙", "其他"}:
+            raise ValueError("未知物品分类。")
+        title = self._community_text(title, "物品名称", 80)
+        description = self._community_text(description, "物品描述", 1500)
+        location = self._community_text(location, "地点", 120)
+        happened_at = self._community_text(happened_at, "日期", 30)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO lost_found_items (username, kind, category, title, description,"
+                " location, happened_at, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                (actor["username"], kind, category, title, description, location,
+                 happened_at, self._now()),
+            )
+            item_id = int(cursor.lastrowid)
+        self._audit(actor["username"], actor["role"], "lost_found_create", str(item_id), kind)
+        return item_id
+
+    def get_lost_found_items(
+        self, actor: dict[str, str], kind: str = "all", include_resolved: bool = False
+    ) -> list[dict[str, Any]]:
+        self._role(actor)
+        sql = "SELECT * FROM lost_found_items WHERE 1=1"
+        params: list[Any] = []
+        if kind in {"lost", "found"}:
+            sql += " AND kind = ?"
+            params.append(kind)
+        if not include_resolved:
+            sql += " AND status = 'open'"
+        sql += " ORDER BY created_at DESC LIMIT 300"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_lost_found_status(
+        self, actor: dict[str, str], item_id: int, status: str
+    ) -> None:
+        self._role(actor)
+        if status not in {"open", "resolved"}:
+            raise ValueError("未知物品状态。")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE lost_found_items SET status=? WHERE id=? AND username=?",
+                (status, item_id, actor["username"]),
+            )
+        if cursor.rowcount == 0:
+            raise PermissionError("只能修改自己发布的物品信息。")
+        self._audit(actor["username"], actor["role"], "lost_found_status", str(item_id), status)
+
+    def create_market_item(
+        self, actor: dict[str, str], title: str, category: str, price: float, description: str
+    ) -> dict[str, Any]:
+        self._role(actor)
+        if category not in {"教材书籍", "数码产品", "交通工具", "生活用品", "其他"}:
+            raise ValueError("未知商品分类。")
+        title = self._community_text(title, "商品名称", 80)
+        description = self._community_text(description, "商品描述", 2000)
+        try:
+            price_value = round(float(price), 2)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("价格必须是数字。") from exc
+        if not 0 <= price_value <= 1_000_000:
+            raise ValueError("价格应在 0 到 1000000 元之间。")
+        moderation = self._moderate_content(title + "\n" + description)
+        reasons = [moderation["reason"]] if moderation["reason"] else []
+        if any(word in title + description for word in ("处方药", "管制刀具", "假证", "代考")):
+            moderation["status"] = "blocked"
+            reasons.append("疑似违规物品或服务")
+        moderation["reason"] = "；".join(reason for reason in reasons if reason)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO market_items (username, title, category, price, description, status,"
+                " risk_status, risk_reason, created_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+                (actor["username"], title, category, price_value, description,
+                 moderation["status"], moderation["reason"], self._now()),
+            )
+            item_id = int(cursor.lastrowid)
+        self._audit(actor["username"], actor["role"], "market_create", str(item_id), moderation["status"])
+        return {"id": item_id, **moderation}
+
+    def get_market_items(self, actor: dict[str, str], include_closed: bool = False) -> list[dict[str, Any]]:
+        self._role(actor)
+        where = "(risk_status='visible' OR username=?)"
+        params: list[Any] = [actor["username"]]
+        if not include_closed:
+            where += " AND (status='active' OR username=?)"
+            params.append(actor["username"])
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM market_items WHERE {where} ORDER BY created_at DESC LIMIT 300", params
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_market_status(self, actor: dict[str, str], item_id: int, status: str) -> None:
+        self._role(actor)
+        if status not in {"active", "sold", "closed"}:
+            raise ValueError("未知商品状态。")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE market_items SET status=? WHERE id=? AND username=?",
+                (status, item_id, actor["username"]),
+            )
+        if cursor.rowcount == 0:
+            raise PermissionError("只能修改自己发布的商品。")
+        self._audit(actor["username"], actor["role"], "market_status", str(item_id), status)
+
+    def send_private_message(
+        self, actor: dict[str, str], recipient: str, content: str
+    ) -> dict[str, Any]:
+        self._role(actor)
+        recipient = self._community_text(recipient, "收件人", 80)
+        content = self._community_text(content, "私信内容", 2000)
+        if recipient == actor["username"]:
+            raise ValueError("不能给自己发送私信。")
+        with self._connect() as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE username=?", (recipient,)).fetchone():
+                raise ValueError("收件人不存在。")
+        # 私信采用实时规则风控，避免把私人内容额外交给生成模型；命中项进入管理员复核队列。
+        moderation = self._moderate_content(content, use_ai=False)
+        message_status = "delivered" if moderation["status"] == "visible" else moderation["status"]
+        moderation["status"] = message_status
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO private_messages (sender, recipient, content, status, moderation_reason,"
+                " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (actor["username"], recipient, content, message_status,
+                 moderation["reason"], self._now()),
+            )
+            message_id = int(cursor.lastrowid)
+        self._audit(actor["username"], actor["role"], "private_message", str(message_id), moderation["status"])
+        return {"id": message_id, **moderation}
+
+    def get_private_messages(
+        self, actor: dict[str, str], peer: str | None = None
+    ) -> list[dict[str, Any]]:
+        self._role(actor)
+        params: list[Any] = [actor["username"], actor["username"]]
+        where = "status='delivered' AND (sender=? OR recipient=?)"
+        if peer:
+            where += " AND ((sender=? AND recipient=?) OR (sender=? AND recipient=?))"
+            params.extend([actor["username"], peer, peer, actor["username"]])
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM private_messages WHERE {where} ORDER BY id ASC LIMIT 500", params
+            ).fetchall()
+            conn.execute(
+                "UPDATE private_messages SET read_at=? WHERE recipient=? AND read_at IS NULL AND status='delivered'",
+                (self._now(), actor["username"]),
+            )
+        return [dict(row) for row in rows]
+
+    def get_message_peers(self, actor: dict[str, str]) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT CASE WHEN sender=? THEN recipient ELSE sender END AS peer,"
+                " MAX(created_at) AS latest_at, SUM(CASE WHEN recipient=? AND read_at IS NULL THEN 1 ELSE 0 END) AS unread"
+                " FROM private_messages WHERE status='delivered' AND (sender=? OR recipient=?)"
+                " GROUP BY peer ORDER BY latest_at DESC",
+                (actor["username"], actor["username"], actor["username"], actor["username"]),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---------- 课表、上课提醒与空教室参考 ----------
+
+    @staticmethod
+    def _valid_hhmm(value: str, label: str) -> str:
+        value = str(value).strip()
+        try:
+            datetime.strptime(value, "%H:%M")
+        except ValueError as exc:
+            raise ValueError(f"{label}必须使用 HH:MM 格式。") from exc
+        return value
+
+    def add_schedule_entry(
+        self, actor: dict[str, str], course_name: str, weekday: int,
+        start_time: str, end_time: str, location: str = "", teacher: str = "",
+    ) -> int:
+        self._role(actor)
+        course_name = self._community_text(course_name, "课程名称", 100)
+        weekday = int(weekday)
+        if weekday not in range(1, 8):
+            raise ValueError("星期必须在 1 到 7 之间。")
+        start_time = self._valid_hhmm(start_time, "开始时间")
+        end_time = self._valid_hhmm(end_time, "结束时间")
+        if start_time >= end_time:
+            raise ValueError("结束时间必须晚于开始时间。")
+        location = self._community_text(location, "上课地点", 100, required=False)
+        teacher = self._community_text(teacher, "教师", 60, required=False)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO schedule_entries (username, course_name, weekday, start_time, end_time,"
+                " location, teacher, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (actor["username"], course_name, weekday, start_time, end_time,
+                 location, teacher, self._now()),
+            )
+            entry_id = int(cursor.lastrowid)
+        return entry_id
+
+    @staticmethod
+    def _schedule_day(value: Any) -> int | None:
+        """识别表头或单元格中的星期，不把课程编号中的数字当作星期。"""
+        text = re.sub(r"\s+", "", str(value or ""))
+        if re.fullmatch(r"[1-7]", text):
+            return int(text)
+        match = re.search(r"(?:星期|周)([一二三四五六日天1-7])", text)
+        if not match:
+            return None
+        token = match.group(1)
+        if token.isdigit():
+            return int(token)
+        return {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7}[token]
+
+    @classmethod
+    def _schedule_day_in_line(cls, line: str) -> int | None:
+        day = cls._schedule_day(line)
+        if day:
+            return day
+        match = re.search(r"(?<![\w.])([1-7])(?![\w.])", line)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _schedule_times(text: str) -> list[tuple[int, int, str]]:
+        result = []
+        pattern = r"(?<!\d)([01]?\d|2[0-3])[:：]([0-5]\d)(?!\d)"
+        for match in re.finditer(pattern, str(text or "")):
+            value = f"{int(match.group(1)):02d}:{match.group(2)}"
+            result.append((match.start(), match.end(), value))
+        return result
+
+    @staticmethod
+    def _schedule_course_name(value: Any) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        text = re.sub(r"^(?:课程名称|课程名|课程)\s*[:：]", "", text)
+        text = re.sub(r"(?:星期|周)[一二三四五六日天1-7]", " ", text)
+        text = re.sub(r"第\s*\d+\s*[-—–~至]\s*\d+\s*周", " ", text)
+        text = re.sub(r"(?:单周|双周|周次\s*[:：]?\s*[\d\-—–~至]+)", " ", text)
+        text = re.sub(r"^\d+\s+(?=[\u4e00-\u9fffA-Za-z])", "", text)
+        text = text.strip(" |｜,，;；-—–")
+        if not 2 <= len(text) <= 100 or text in {"课程", "课程名称", "课程名", "无", "暂无"}:
+            return ""
+        if not re.search(r"[\u4e00-\u9fffA-Za-z]", text):
+            return ""
+        return text
+
+    @classmethod
+    def _schedule_cell_details(cls, content: Any) -> tuple[str, str, str]:
+        """从周视图单元格提取课程、地点和教师；不确定的可选字段留空。"""
+        lines = [re.sub(r"\s+", " ", line).strip() for line in re.split(r"[\n\r]+", str(content or "")) if line.strip()]
+        teacher = ""
+        location = ""
+        course = ""
+        for line in lines:
+            compact = line.strip()
+            if not teacher and re.search(r"教师|老师|教授|讲师", compact):
+                candidate = re.sub(r"^(?:任课)?(?:教师|老师)\s*[:：]?", "", compact).strip()
+                teacher = candidate[:60]
+                continue
+            if not location and (
+                re.search(r"教室|教学楼|实验楼|图书馆|体育馆|活动中心|中心|[A-Za-z]\d{3,4}", compact)
+            ):
+                location = compact[:100]
+                continue
+            if re.search(r"第\s*\d+\s*[-—–~至]?\s*\d*\s*周|单周|双周|周次", compact):
+                continue
+            if cls._schedule_times(compact) and len(cls._schedule_times(compact)) >= 2:
+                continue
+            if not course:
+                course = cls._schedule_course_name(compact)
+        return course, location, teacher
+
+    def _parse_schedule_table(
+        self, table: list[list[Any]], page_number: int, table_number: int
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """解析按课程排列的表格，以及星期按列排列的周视图表格。"""
+        rows = [
+            [re.sub(r"[ \t]+", " ", str(cell or "")).strip() for cell in row]
+            for row in (table or []) if row
+        ]
+        if len(rows) < 2:
+            return [], []
+        entries: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        def find_column(headers: list[str], aliases: tuple[str, ...]) -> int | None:
+            for index, header in enumerate(headers):
+                compact = re.sub(r"\s+", "", header)
+                if any(compact == alias or alias in compact for alias in aliases):
+                    return index
+            return None
+
+        for header_index, headers in enumerate(rows):
+            course_col = find_column(headers, ("课程名称", "课程名", "课程"))
+            day_col = find_column(headers, ("上课星期", "星期几", "星期"))
+            start_col = find_column(headers, ("开始时间", "起始时间", "上课开始"))
+            end_col = find_column(headers, ("结束时间", "截止时间", "下课时间"))
+            time_col = find_column(headers, ("上课时间", "节次时间", "时间"))
+            if course_col is None or day_col is None or (time_col is None and (start_col is None or end_col is None)):
+                continue
+            location_col = find_column(headers, ("上课地点", "教室", "地点"))
+            teacher_col = find_column(headers, ("任课教师", "教师", "老师"))
+            last_day = None
+            for row_index, row in enumerate(rows[header_index + 1:], start=header_index + 2):
+                def cell(index: int | None) -> str:
+                    return row[index] if index is not None and index < len(row) else ""
+
+                course = self._schedule_course_name(cell(course_col))
+                last_day = self._schedule_day(cell(day_col)) or last_day
+                if not course and not any(row):
+                    continue
+                time_text = (
+                    f"{cell(start_col)} {cell(end_col)}"
+                    if start_col is not None and end_col is not None else cell(time_col)
+                )
+                times = self._schedule_times(time_text)
+                if not course or not last_day or len(times) < 2:
+                    if any(row):
+                        errors.append(f"第 {page_number} 页表格 {table_number} 第 {row_index} 行：缺少课程名、星期或具体起止时间。")
+                    continue
+                entries.append({
+                    "course_name": course, "weekday": last_day,
+                    "start_time": times[0][2], "end_time": times[1][2],
+                    "location": cell(location_col)[:100], "teacher": cell(teacher_col)[:60],
+                    "source_page": page_number,
+                })
+            return entries, errors
+
+        # 周视图：表头包含至少两个“星期X”，每行第一列给出具体时间。
+        for header_index, headers in enumerate(rows):
+            day_columns = [(index, self._schedule_day(cell)) for index, cell in enumerate(headers)]
+            day_columns = [(index, day) for index, day in day_columns if day]
+            if len(day_columns) < 2:
+                continue
+            last_times: list[tuple[int, int, str]] = []
+            for row_index, row in enumerate(rows[header_index + 1:], start=header_index + 2):
+                first_cell = row[0] if row else ""
+                row_times = self._schedule_times(first_cell)
+                if len(row_times) >= 2:
+                    last_times = row_times[:2]
+                elif first_cell:
+                    last_times = []
+                for column, day in day_columns:
+                    content = row[column] if column < len(row) else ""
+                    if not content.strip():
+                        continue
+                    course, location, teacher = self._schedule_cell_details(content)
+                    if not course:
+                        continue
+                    if len(last_times) < 2:
+                        message = f"第 {page_number} 页表格 {table_number} 第 {row_index} 行：{course} 缺少具体起止时间。"
+                        if message not in errors:
+                            errors.append(message)
+                        continue
+                    entries.append({
+                        "course_name": course, "weekday": day,
+                        "start_time": last_times[0][2], "end_time": last_times[1][2],
+                        "location": location, "teacher": teacher, "source_page": page_number,
+                    })
+            return entries, errors
+        return [], []
+
+    def _parse_schedule_text(self, text: str, page_number: int) -> tuple[list[dict[str, Any]], list[str]]:
+        """从普通文字 PDF 或 OCR 结果中识别一行一门课的记录。"""
+        entries: list[dict[str, Any]] = []
+        errors: list[str] = []
+        current_day = None
+        pending_lines: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = re.sub(r"[\u00a0\u3000]", " ", raw_line).strip()
+            if not line:
+                continue
+            if "课程" in line and "星期" in line and "时间" in line:
+                continue
+            explicit_day = self._schedule_day_in_line(line)
+            current_day = explicit_day or current_day
+            day = explicit_day or current_day
+            times = self._schedule_times(line)
+            if len(times) < 2:
+                if not re.search(r"星期|周[一二三四五六日天]|节次|时间", line):
+                    pending_lines = (pending_lines + [line])[-2:]
+                continue
+            first, second = times[0], times[1]
+            before = line[:first[0]]
+            after = line[second[1]:]
+            before = re.sub(r"(?:星期|周)\s*[一二三四五六日天1-7]", " ", before)
+            if not self._schedule_day(line):
+                before = re.sub(r"(?<![\w.])[1-7](?![\w.])", " ", before)
+            course = self._schedule_course_name(before)
+            parts = [part.strip() for part in re.split(r"\s*[|｜]\s*|\t+|\s{2,}", after) if part.strip()]
+            if len(parts) <= 1:
+                parts = after.split()
+            if not course and parts:
+                course = self._schedule_course_name(parts.pop(0))
+            if not course and pending_lines:
+                course = self._schedule_course_name(pending_lines[-1])
+            if not course or not day:
+                errors.append(f"第 {page_number} 页：一条含时间的记录缺少课程名或星期，未导入。")
+                continue
+            location = parts[0][:100] if parts else ""
+            teacher = parts[1][:60] if len(parts) > 1 else ""
+            entries.append({
+                "course_name": course, "weekday": day,
+                "start_time": first[2], "end_time": second[2],
+                "location": location, "teacher": teacher, "source_page": page_number,
+            })
+            pending_lines = []
+        return entries, errors
+
+    def parse_schedule_pdf(
+        self, actor: dict[str, str], content: bytes, use_ocr: bool = False
+    ) -> dict[str, Any]:
+        """本地解析 PDF，仅返回预览；确认后才写入个人课表。"""
+        self._role(actor)
+        if not content:
+            raise ValueError("PDF 文件为空。")
+        if len(content) > 20 * 1024 * 1024:
+            raise ValueError("课表 PDF 不能超过 20 MB。")
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            if reader.is_encrypted:
+                raise ValueError("暂不支持加密 PDF，请先解除密码保护。")
+            page_count = len(reader.pages)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("PDF 无法读取，请确认文件未损坏，并且确实是 PDF 格式。") from exc
+        if page_count > 30:
+            raise ValueError("课表 PDF 最多支持 30 页，请拆分后再导入。")
+
+        try:
+            import pdfplumber
+        except ImportError:
+            pdfplumber = None
+
+        entries: list[dict[str, Any]] = []
+        errors: list[str] = []
+        warnings: list[str] = []
+        ocr_pages: list[int] = []
+        text_pages = 0
+        if pdfplumber is None:
+            warnings.append("未安装 pdfplumber，复杂表格可能无法完整识别；可运行 python -m pip install pdfplumber 增强识别。")
+
+        with tempfile.TemporaryDirectory(prefix="campus_schedule_") as temp_dir:
+            temp_pdf = Path(temp_dir) / "schedule.pdf"
+            if use_ocr:
+                temp_pdf.write_bytes(content)
+            for page_index in range(page_count):
+                page_number = page_index + 1
+                page_entries: list[dict[str, Any]] = []
+                text = ""
+                if pdfplumber is not None:
+                    try:
+                        with pdfplumber.open(io.BytesIO(content)) as pdf:
+                            page = pdf.pages[page_index]
+                            for table_number, table in enumerate(page.extract_tables() or [], start=1):
+                                found, table_errors = self._parse_schedule_table(table, page_number, table_number)
+                                page_entries.extend(found)
+                                errors.extend(table_errors)
+                            try:
+                                text = page.extract_text(layout=True) or ""
+                            except TypeError:
+                                text = page.extract_text() or ""
+                    except Exception as exc:
+                        warnings.append(f"第 {page_number} 页表格读取失败，已尝试普通文字识别：{exc}")
+                if not text:
+                    try:
+                        text = reader.pages[page_index].extract_text(extraction_mode="layout") or ""
+                    except (TypeError, ValueError):
+                        text = reader.pages[page_index].extract_text() or ""
+                    except Exception:
+                        text = ""
+                if len(re.sub(r"\s+", "", text)) >= 2:
+                    text_pages += 1
+                if use_ocr and len(re.sub(r"\s+", "", text)) < 20:
+                    ocr_text = self._ocr_pdf_page(temp_pdf, page_index).strip()
+                    if ocr_text:
+                        text = ocr_text
+                        page_entries = []
+                        ocr_pages.append(page_number)
+                if not page_entries and text:
+                    page_entries, text_errors = self._parse_schedule_text(text, page_number)
+                    errors.extend(text_errors)
+                entries.extend(page_entries)
+                if not text and not use_ocr:
+                    warnings.append(f"第 {page_number} 页没有可读取文字；如果是扫描件，请勾选本地 OCR。")
+
+        # 表格和普通文字可能识别到同一课程，按课程、星期和时间合并。
+        merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for entry in entries:
+            key = (entry["course_name"], entry["weekday"], entry["start_time"], entry["end_time"])
+            if key not in merged:
+                merged[key] = entry
+            else:
+                for field in ("location", "teacher"):
+                    if not merged[key].get(field) and entry.get(field):
+                        merged[key][field] = entry[field]
+        result_entries = list(merged.values())
+        if len(result_entries) > 500:
+            result_entries = result_entries[:500]
+            warnings.append("最多预览 500 条课程，其余课程未处理。")
+        if not result_entries:
+            warnings.append("没有识别出完整课程。PDF 需包含课程名、星期和具体起止时间；也可以下载 CSV 模板整理后导入。")
+        return {
+            "entries": result_entries, "errors": errors[:100], "warnings": list(dict.fromkeys(warnings)),
+            "pages": page_count, "text_pages": text_pages, "ocr_pages": ocr_pages,
+        }
+
+    def import_schedule_entries(
+        self, actor: dict[str, str], entries: list[dict[str, Any]], source: str = "PDF"
+    ) -> dict[str, Any]:
+        """导入已解析课程，并跳过当前账户已有的同课程、同星期、同时间记录。"""
+        self._role(actor)
+        success = 0
+        duplicates = 0
+        errors: list[str] = []
+        existing = {
+            (row["course_name"], row["weekday"], row["start_time"], row["end_time"])
+            for row in self.get_schedule(actor)
+        }
+        for index, entry in enumerate(entries[:500], start=1):
+            try:
+                course = str(entry.get("course_name", "")).strip()
+                day = int(entry.get("weekday", 0))
+                start = self._valid_hhmm(str(entry.get("start_time", "")), "开始时间")
+                end = self._valid_hhmm(str(entry.get("end_time", "")), "结束时间")
+                key = (course, day, start, end)
+                if key in existing:
+                    duplicates += 1
+                    continue
+                self.add_schedule_entry(
+                    actor, course, day, start, end,
+                    str(entry.get("location", "") or ""), str(entry.get("teacher", "") or ""),
+                )
+                existing.add(key)
+                success += 1
+            except Exception as exc:
+                errors.append(f"第 {index} 条：{exc}")
+        if len(entries) > 500:
+            errors.append("最多导入 500 条课程，其余课程未处理。")
+        self._audit(
+            actor["username"], actor["role"], "schedule_import",
+            detail=f"{source}：成功 {success}，重复 {duplicates}，失败 {len(errors)}",
+        )
+        return {"success": success, "duplicates": duplicates, "errors": errors}
+
+    def import_schedule_pdf(
+        self, actor: dict[str, str], content: bytes, use_ocr: bool = False
+    ) -> dict[str, Any]:
+        preview = self.parse_schedule_pdf(actor, content, use_ocr=use_ocr)
+        result = self.import_schedule_entries(actor, preview["entries"], source="PDF")
+        result["errors"] = preview["errors"] + result["errors"]
+        result["warnings"] = preview["warnings"]
+        return result
+
+    def import_schedule_csv(self, actor: dict[str, str], content: bytes) -> dict[str, Any]:
+        self._role(actor)
+        if len(content) > 2 * 1024 * 1024:
+            raise ValueError("课表 CSV 不能超过 2 MB。")
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("请使用 UTF-8 编码的 CSV 文件。") from exc
+        reader = csv.DictReader(io.StringIO(text))
+        required = {"课程", "星期", "开始时间", "结束时间"}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            raise ValueError("CSV 表头必须包含：课程、星期、开始时间、结束时间；地点和教师可选。")
+        success = 0
+        errors = []
+        for index, row in enumerate(reader, start=2):
+            if index > 502:
+                errors.append("最多导入 500 条课程，其余行未处理。")
+                break
+            try:
+                self.add_schedule_entry(
+                    actor, row.get("课程", ""), int(str(row.get("星期", "")).strip()),
+                    row.get("开始时间", ""), row.get("结束时间", ""),
+                    row.get("地点", "") or "", row.get("教师", "") or "",
+                )
+                success += 1
+            except Exception as exc:
+                errors.append(f"第 {index} 行：{exc}")
+        self._audit(actor["username"], actor["role"], "schedule_import", detail=f"成功 {success}，失败 {len(errors)}")
+        return {"success": success, "errors": errors}
+
+    def get_schedule(self, actor: dict[str, str], weekday: int | None = None) -> list[dict[str, Any]]:
+        self._role(actor)
+        sql = "SELECT * FROM schedule_entries WHERE username=?"
+        params: list[Any] = [actor["username"]]
+        if weekday in range(1, 8):
+            sql += " AND weekday=?"
+            params.append(weekday)
+        sql += " ORDER BY weekday, start_time, id"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_schedule_entry(self, actor: dict[str, str], entry_id: int) -> None:
+        self._role(actor)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM schedule_entries WHERE id=? AND username=?", (entry_id, actor["username"])
+            )
+        if cursor.rowcount == 0:
+            raise PermissionError("只能删除自己的课程。")
+
+    def get_upcoming_classes(self, actor: dict[str, str]) -> list[dict[str, Any]]:
+        now = datetime.now()
+        today = now.isoweekday()
+        current = now.strftime("%H:%M")
+        result = []
+        for entry in self.get_schedule(actor, today):
+            if entry["start_time"] >= current:
+                start_dt = datetime.strptime(entry["start_time"], "%H:%M").replace(
+                    year=now.year, month=now.month, day=now.day
+                )
+                result.append({**entry, "minutes": max(0, int((start_dt - now).total_seconds() // 60))})
+        return result
+
+    def find_free_rooms(
+        self, actor: dict[str, str], weekday: int, start_time: str, end_time: str
+    ) -> dict[str, Any]:
+        self._role(actor)
+        start_time = self._valid_hhmm(start_time, "开始时间")
+        end_time = self._valid_hhmm(end_time, "结束时间")
+        if start_time >= end_time:
+            raise ValueError("结束时间必须晚于开始时间。")
+        if int(weekday) not in range(1, 8):
+            raise ValueError("星期无效。")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT location, start_time, end_time FROM schedule_entries"
+                " WHERE weekday=? AND location != ''", (int(weekday),)
+            ).fetchall()
+        rooms = sorted({row["location"] for row in rows})
+        occupied = sorted({
+            row["location"] for row in rows
+            if row["start_time"] < end_time and row["end_time"] > start_time
+        })
+        return {"rooms": rooms, "occupied": occupied,
+                "free": [room for room in rooms if room not in occupied]}
+
+    # ---------- 校园活动报名 ----------
+
+    def create_activity(
+        self, actor: dict[str, str], title: str, description: str, location: str,
+        starts_at: str, ends_at: str, capacity: int,
+    ) -> int:
+        self._require_admin(actor)
+        title = self._community_text(title, "活动名称", 100)
+        description = self._community_text(description, "活动介绍", 3000)
+        location = self._community_text(location, "活动地点", 120)
+        try:
+            start = datetime.fromisoformat(starts_at)
+            end = datetime.fromisoformat(ends_at)
+        except ValueError as exc:
+            raise ValueError("活动时间格式无效。") from exc
+        if end <= start:
+            raise ValueError("活动结束时间必须晚于开始时间。")
+        capacity = int(capacity)
+        if not 1 <= capacity <= 100000:
+            raise ValueError("活动人数应在 1 到 100000 之间。")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO activities (title, description, location, starts_at, ends_at, capacity,"
+                " created_by, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'published', ?)",
+                (title, description, location, starts_at, ends_at, capacity,
+                 actor["username"], self._now()),
+            )
+            activity_id = int(cursor.lastrowid)
+        self._audit(actor["username"], actor["role"], "activity_create", str(activity_id), title)
+        return activity_id
+
+    def get_activities(self, actor: dict[str, str]) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT a.*, COUNT(e.username) AS enrolled_count,"
+                " EXISTS(SELECT 1 FROM activity_enrollments x WHERE x.activity_id=a.id AND x.username=?) AS enrolled"
+                " FROM activities a LEFT JOIN activity_enrollments e ON e.activity_id=a.id"
+                " GROUP BY a.id ORDER BY a.starts_at DESC", (actor["username"],)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def enroll_activity(self, actor: dict[str, str], activity_id: int) -> None:
+        self._role(actor)
+        with self._connect() as conn:
+            activity = conn.execute(
+                "SELECT * FROM activities WHERE id=? AND status='published'", (activity_id,)
+            ).fetchone()
+            if not activity:
+                raise ValueError("活动不存在或已取消。")
+            if datetime.fromisoformat(activity["ends_at"]) < datetime.now():
+                raise ValueError("活动已结束，不能继续报名。")
+            count = conn.execute(
+                "SELECT COUNT(*) FROM activity_enrollments WHERE activity_id=?", (activity_id,)
+            ).fetchone()[0]
+            if count >= activity["capacity"]:
+                raise ValueError("活动名额已满。")
+            try:
+                conn.execute(
+                    "INSERT INTO activity_enrollments VALUES (?, ?, ?)",
+                    (activity_id, actor["username"], self._now()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("你已经报名过该活动。") from exc
+        self._audit(actor["username"], actor["role"], "activity_enroll", str(activity_id))
+
+    def cancel_activity_enrollment(self, actor: dict[str, str], activity_id: int) -> None:
+        self._role(actor)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM activity_enrollments WHERE activity_id=? AND username=?",
+                (activity_id, actor["username"]),
+            )
+        if cursor.rowcount == 0:
+            raise ValueError("你没有报名该活动。")
+        self._audit(actor["username"], actor["role"], "activity_cancel_enrollment", str(activity_id))
+
+    def set_activity_status(self, actor: dict[str, str], activity_id: int, status: str) -> None:
+        self._require_admin(actor)
+        if status not in {"published", "cancelled"}:
+            raise ValueError("未知活动状态。")
+        with self._connect() as conn:
+            cursor = conn.execute("UPDATE activities SET status=? WHERE id=?", (status, activity_id))
+        if cursor.rowcount == 0:
+            raise ValueError("活动不存在。")
+
+    def get_activity_participants(self, actor: dict[str, str], activity_id: int) -> list[dict[str, str]]:
+        self._require_admin(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT e.username, u.role, e.created_at FROM activity_enrollments e"
+                " LEFT JOIN users u ON u.username=e.username WHERE e.activity_id=? ORDER BY e.created_at",
+                (activity_id,),
+            ).fetchall()
+        return [{"username": row["username"], "role": ROLE_NAMES.get(row["role"], row["role"]),
+                 "created_at": row["created_at"]} for row in rows]
+
+    # ---------- 本地 AI 学业规划 ----------
+
+    def generate_study_plan(
+        self, actor: dict[str, str], grade: str, major: str, goal: str
+    ) -> dict[str, Any]:
+        self._role(actor)
+        grade = self._community_text(grade, "年级", 30)
+        major = self._community_text(major, "专业", 80)
+        goal = self._community_text(goal, "目标", 80)
+        sources = []
+        try:
+            retrieval = self.retrieve(actor, f"{major} {goal} 培养方案 课程 竞赛 证书 就业", top_k=4)
+            for index, entry in enumerate(retrieval["entries"], start=1):
+                doc = entry["doc"]
+                evidence, _, _ = self._evidence(doc, f"{major} {goal}")
+                sources.append({"id": index, "source": doc.metadata.get("source", ""),
+                                "page": doc.metadata.get("page"), "evidence": evidence,
+                                "content": doc.page_content[:1200]})
+        except Exception:
+            sources = []
+        prompt = f"""请为学生生成一份可执行的学业规划表。通用建议可以基于常识，但涉及本校课程、绩点、证书或竞赛要求时只能引用所给资料，不得编造。
+年级：{grade}；专业：{major}；目标：{goal}
+请输出 Markdown 表格，列为“阶段｜学习重点｜具体行动｜检查方式”，至少4行；表格后补充3条本学期可执行任务。
+不要承诺保研、录取或就业结果，不要把通用建议写成学校硬性规定。
+本校资料：
+{chr(10).join(f"[资料{s['id']}] {s['content']}" for s in sources) if sources else '暂无本校相关资料，请只给通用建议。'}
+"""
+        notice = ""
+        try:
+            plan = str(self.llm.invoke(prompt)).strip()
+            if len(plan) < 100 or "|" not in plan:
+                raise ValueError("模型没有返回完整规划表")
+            plan = plan[:6500]
+        except Exception as exc:
+            notice = f"本地模型未能生成完整规划，已提供通用模板：{exc}"
+            plan = (
+                "| 阶段 | 学习重点 | 具体行动 | 检查方式 |\n|---|---|---|---|\n"
+                f"| 第1个月 | 明确{goal}目标 | 整理当前课程、能力和时间，确定一个主目标 | 写出一页目标清单 |\n"
+                "| 第2—3个月 | 打牢专业基础 | 每周安排固定学习时间，补齐核心课程薄弱点 | 每周复盘一次完成情况 |\n"
+                "| 第4—5个月 | 项目或实践 | 完成一个与专业相关的小项目或实践作品 | 保留代码、报告或作品记录 |\n"
+                "| 第6个月 | 总结与调整 | 对照目标检查差距，安排下一阶段任务 | 更新一次规划表 |\n\n"
+                "本学期可执行：1. 每周固定三次专业学习。2. 每月完成一次成果总结。3. 向教师或辅导员核对本校具体要求。"
+            )
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO study_plans (username, grade, major, goal, plan_text, model, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (actor["username"], grade, major, goal, plan, self.llm_model, self._now()),
+            )
+            plan_id = int(cursor.lastrowid)
+        self._audit(actor["username"], actor["role"], "study_plan", str(plan_id), goal)
+        return {"id": plan_id, "plan": plan, "sources": sources, "notice": notice}
+
+    def get_study_plans(self, actor: dict[str, str]) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM study_plans WHERE username=? ORDER BY id DESC LIMIT 50",
+                (actor["username"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---------- 匿名树洞与心情记录（不做医疗诊断） ----------
+
+    def create_mood_post(self, actor: dict[str, str], content: str) -> dict[str, Any]:
+        self._role(actor)
+        content = self._community_text(content, "树洞内容", 2000)
+        moderation = self._moderate_content(content)
+        if re.search(r"自杀|不想活|伤害自己|结束生命|自残", content):
+            moderation["status"] = "review"
+            moderation["reason"] = "；".join(filter(None, [moderation["reason"], "包含可能的自伤内容，暂不公开"]))
+            moderation["crisis"] = True
+            moderation["support_message"] = (
+                "你的安全比发帖更重要。请现在联系一位可信任的人陪着你，并尽快联系学校心理中心或专业医疗机构；"
+                "如果有即时危险，请立即拨打当地急救或报警电话（中国大陆可拨打 120 或 110）。"
+            )
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO mood_posts (username, content, status, moderation_reason, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (actor["username"], content, moderation["status"], moderation["reason"], self._now()),
+            )
+            post_id = int(cursor.lastrowid)
+        return {"id": post_id, **moderation}
+
+    def get_mood_posts(self, actor: dict[str, str]) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, content, created_at FROM mood_posts WHERE status='visible'"
+                " ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+        return [{**dict(row), "alias": f"匿名同学 {row['id']:04d}"} for row in rows]
+
+    def create_mood_checkin(
+        self, actor: dict[str, str], mood_score: int, note: str = ""
+    ) -> dict[str, Any]:
+        self._role(actor)
+        mood_score = int(mood_score)
+        if mood_score not in range(1, 6):
+            raise ValueError("心情分值应在 1 到 5 之间。")
+        note = self._community_text(note, "心情记录", 1000, required=False)
+        crisis = bool(re.search(r"自杀|不想活|伤害自己|结束生命|自残", note))
+        if crisis:
+            response = (
+                "你刚才的文字可能表示你正处在强烈痛苦中。请现在就联系一位可信任的人陪着你，"
+                "并尽快联系学校心理中心或专业医疗机构；如果有即时危险，请立即拨打当地急救或报警电话"
+                "（中国大陆可拨打 120 或 110）。这里不能替代专业帮助，也不需要你独自承担。"
+            )
+        else:
+            fallback = (
+                "谢谢你记录此刻的感受。可以先做一次缓慢呼吸、喝点水，并把今天最需要完成的一件事缩小到十分钟。"
+                if mood_score <= 2 else "谢谢你记录此刻的感受。可以留意今天让你感觉稍好一点的小事，并保持规律作息。"
+            )
+            prompt = f"""请用中文写一段80字以内的支持性回应，温和、具体、不评判。
+不能诊断抑郁、焦虑或任何疾病，不能承诺保密或24小时陪伴，不要替代专业心理服务。
+心情评分1到5分，本次为{mood_score}分。记录：{note[:800] or '未填写'}
+"""
+            try:
+                response = str(self.llm.invoke(prompt)).strip()[:600]
+                if len(response) < 10:
+                    response = fallback
+            except Exception:
+                response = fallback
+            if mood_score <= 2:
+                response += " 如果低落持续影响生活，建议联系可信任的人、学校心理中心或专业医疗机构。"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO mood_checkins (username, mood_score, note, response, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (actor["username"], mood_score, note, response, self._now()),
+            )
+            checkin_id = int(cursor.lastrowid)
+        return {"id": checkin_id, "response": response, "crisis": crisis}
+
+    def get_mood_checkins(self, actor: dict[str, str]) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM mood_checkins WHERE username=? ORDER BY id DESC LIMIT 100",
+                (actor["username"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     # ---------- 历史、CSV 与审计查询 ----------
 
     def get_qa_records(self, actor: dict[str, str], limit: int = 30) -> list[dict[str, Any]]:
@@ -1560,6 +3274,8 @@ class CampusRAG:
                 "answer": row["answer"],
                 "sources": json.loads(row["sources_json"]),
                 "confidence": int(row["confidence"]),
+                "trust_score": int(row["trust_score"]),
+                "trust_explanation": row["trust_explanation"],
                 "model": row["model"],
                 "retrieval_mode": row["retrieval_mode"],
                 "rerank_used": bool(row["rerank_used"]),
@@ -1646,6 +3362,98 @@ class CampusRAG:
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
+    def get_operations_dashboard(
+        self, actor: dict[str, str], days: int = 30
+    ) -> dict[str, Any]:
+        """聚合问答运营数据；管理员看全校汇总，其他角色只看自己的记录。"""
+        role = self._role(actor)
+        days = max(1, min(int(days), 365))
+        since = (datetime.now().astimezone() - timedelta(days=days)).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            if role == "admin":
+                rows = conn.execute(
+                    "SELECT created_at, question, resolved_question, sources_json, trust_score, feedback"
+                    " FROM qa_records WHERE created_at >= ? ORDER BY id DESC LIMIT 5000",
+                    (since,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT created_at, question, resolved_question, sources_json, trust_score, feedback"
+                    " FROM qa_records WHERE created_at >= ? AND username = ?"
+                    " ORDER BY id DESC LIMIT 5000",
+                    (since, actor["username"]),
+                ).fetchall()
+
+        hot: dict[str, dict[str, Any]] = {}
+        unanswered = []
+        daily: dict[str, int] = {}
+        hourly = {str(hour): 0 for hour in range(24)}
+        source_usage: dict[str, dict[str, Any]] = {}
+        feedback_counts = {"useful": 0, "useless": 0, "unrated": 0}
+        trust_values = []
+        answered = 0
+        allowed = set(self._allowed_groups(actor))
+        for row in rows:
+            try:
+                sources = json.loads(row["sources_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                sources = []
+            question = str(row["resolved_question"] or row["question"]).strip()
+            normalized = re.sub(r"[\s，。！？!?？]", "", question).lower()
+            if normalized:
+                entry = hot.setdefault(normalized, {"question": question, "count": 0})
+                entry["count"] += 1
+            created = str(row["created_at"])
+            daily[created[:10]] = daily.get(created[:10], 0) + 1
+            if len(created) >= 13 and created[11:13].isdigit():
+                hourly[str(int(created[11:13]))] += 1
+            feedback = row["feedback"] if row["feedback"] in {"useful", "useless"} else "unrated"
+            feedback_counts[feedback] += 1
+            if sources:
+                answered += 1
+                trust_values.append(int(row["trust_score"] or 0))
+            else:
+                unanswered.append({
+                    "question": self._mask_sensitive(question), "created_at": created
+                })
+            seen_in_record = set()
+            for source in sources:
+                group = source.get("group")
+                if role != "admin" and group not in allowed:
+                    continue
+                source_name = str(source.get("source", "未知文档"))
+                key = f"{group}/{source_name}"
+                if key in seen_in_record:
+                    continue
+                seen_in_record.add(key)
+                item = source_usage.setdefault(key, {
+                    "source": source_name, "group_name": source.get("group_name", GROUPS.get(group, group)),
+                    "count": 0,
+                })
+                item["count"] += 1
+
+        start_date = datetime.now().astimezone().date() - timedelta(days=days - 1)
+        daily_counts = []
+        for offset in range(days):
+            day = (start_date + timedelta(days=offset)).isoformat()
+            daily_counts.append({"date": day, "count": daily.get(day, 0)})
+        result = {
+            "scope": "全校汇总（不含用户名）" if role == "admin" else "仅当前账户",
+            "days": days, "total_questions": len(rows), "answered": answered,
+            "unanswered": len(rows) - answered,
+            "answer_rate": answered / len(rows) if rows else 0,
+            "average_trust": round(sum(trust_values) / len(trust_values)) if trust_values else 0,
+            "hot_questions": sorted(hot.values(), key=lambda item: item["count"], reverse=True)[:10],
+            "unanswered_questions": unanswered[:20],
+            "daily_counts": daily_counts,
+            "hourly_counts": [{"hour": f"{hour}:00", "count": hourly[str(hour)]} for hour in range(24)],
+            "source_usage": sorted(source_usage.values(), key=lambda item: item["count"], reverse=True)[:15],
+            "feedback_counts": feedback_counts,
+        }
+        for item in result["hot_questions"]:
+            item["question"] = self._mask_sensitive(item["question"])
+        self._audit(actor["username"], actor["role"], "view_dashboard", result["scope"], f"{days} 天")
+        return result
 
 
     @staticmethod

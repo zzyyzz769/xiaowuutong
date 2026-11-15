@@ -4,6 +4,7 @@ import csv
 import hashlib
 import hmac
 import io
+import importlib.util
 import json
 import re
 import secrets
@@ -156,6 +157,30 @@ class CampusRAG:
             for item in payload.get("models", [])
             if str(item.get("name", "")).strip()
         })
+
+    @staticmethod
+    def missing_ocr_dependencies() -> list[str]:
+        """返回缺少的 OCR 安装包名，仅检查本机环境，不自动联网安装。"""
+        modules = {
+            "fitz": "pymupdf",
+            "rapidocr_onnxruntime": "rapidocr-onnxruntime",
+            "numpy": "numpy",
+            "PIL": "pillow",
+        }
+        return [
+            package for module, package in modules.items()
+            if importlib.util.find_spec(module) is None
+        ]
+
+    @classmethod
+    def ocr_requirement_notice(cls) -> str:
+        missing = cls.missing_ocr_dependencies()
+        if not missing:
+            return ""
+        return (
+            "扫描件 OCR 缺少组件：" + "、".join(missing)
+            + "。请在项目环境中运行：python -m pip install " + " ".join(missing)
+        )
 
     def _generation_failure_notice(self, exc: Exception) -> str:
         """把常见模型错误转成用户能直接处理的说明。"""
@@ -780,8 +805,9 @@ class CampusRAG:
             from PIL import Image
             from rapidocr_onnxruntime import RapidOCR
         except ImportError as exc:
+            requirement = self.ocr_requirement_notice()
             raise RuntimeError(
-                "扫描件 OCR 需要安装 pymupdf、rapidocr_onnxruntime、numpy 和 pillow。"
+                requirement or "扫描件 OCR 组件无法导入，请重新运行安装校务通.bat。"
             ) from exc
         if self._ocr_engine is None:
             self._ocr_engine = RapidOCR()
@@ -2051,26 +2077,60 @@ class CampusRAG:
         group: str,
         filename: str,
         page: int | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
+        """读取有权来源；PDF 只处理目标页，OCR 不可用时仍允许下载原文件。"""
         if group not in self._allowed_groups(actor):
             self._audit(actor.get("username", "?"), actor.get("role", "?"),
                         "access_denied", f"{group}/{filename}", "越权读取原文")
             raise PermissionError("当前角色无权查看该来源文档。")
-        documents = self._load_file(group, filename, use_ocr=True)
-        if page is not None:
-            pages = [d for d in documents if d.metadata.get("page") == page]
-            if not pages:
-                raise ValueError("未找到对应 PDF 页面。")
-            text = "\n\n".join(d.page_content for d in pages)
-            location = f"第 {page} 页"
+        path = self._path(group, filename)
+        if not path.is_file():
+            raise FileNotFoundError(f"文件不存在：{GROUPS[group]}/{filename}")
+
+        notice = ""
+        used_ocr = False
+        file_bytes = None
+        if path.suffix.lower() == ".pdf":
+            reader = PdfReader(str(path))
+            if reader.is_encrypted:
+                raise ValueError("加密 PDF 请先解除密码保护后再查看。")
+            if page is None:
+                documents = self._load_file(group, filename, use_ocr=False)
+                text = "\n\n".join(d.page_content for d in documents)
+                location = "PDF 全文"
+            else:
+                page = int(page)
+                if page < 1 or page > len(reader.pages):
+                    raise ValueError("未找到对应 PDF 页面。")
+                text = (reader.pages[page - 1].extract_text() or "").strip()
+                location = f"第 {page} 页"
+                if len(re.sub(r"\s+", "", text)) < 20:
+                    try:
+                        # 只识别用户打开的这一页，不再扫描整份文档。
+                        text = self._ocr_pdf_page(path, page - 1).strip()
+                        used_ocr = bool(text)
+                    except Exception as exc:
+                        text = ""
+                        notice = (
+                            f"{exc}。当前可先查看该来源已保存的切片文字，"
+                            f"或下载原始 PDF 后打开第 {page} 页核对。"
+                        )
+                if not text and not notice:
+                    notice = f"第 {page} 页没有可提取文字，请下载原始 PDF 核对。"
+            file_bytes = path.read_bytes()
         else:
+            documents = self._load_file(group, filename, use_ocr=False)
             text = "\n\n".join(d.page_content for d in documents)
-            location = "DOCX 全文" if Path(filename).suffix.lower() == ".docx" else "文档全文"
+            location = "DOCX 全文" if path.suffix.lower() == ".docx" else "文档全文"
+
         self._audit(
             actor["username"], actor["role"], "view_source",
-            f"{group}/{filename}", location,
+            f"{group}/{filename}", location + ("；本地 OCR" if used_ocr else ""),
         )
-        return {"text": text, "location": location}
+        return {
+            "text": text, "location": location, "notice": notice,
+            "used_ocr": used_ocr, "file_bytes": file_bytes, "file_name": filename,
+        }
 
     # ---------- 文档摘要、时间识别与新旧规定治理 ----------
 

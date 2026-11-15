@@ -822,25 +822,45 @@ def show_sources(sources: list[dict], record_id: int) -> None:
                         source.get("page"),
                     )
                     snippet = source.get("highlight") or evidence
+                    opened_text = opened.get("text") or ""
+                    saved_text = source.get("content") or ""
+                    display_text = opened_text or saved_text
                     st.session_state.preview = {
                         "key": preview_key,
                         "title": f"{source['group_name']}/{source['source']}",
                         "location": opened["location"],
-                        "html": highlight_document(opened["text"], snippet),
+                        "html": highlight_document(display_text, snippet) if display_text else "",
+                        "notice": opened.get("notice") or "",
+                        "using_saved_text": not opened_text and bool(saved_text),
+                        "file_bytes": opened.get("file_bytes"),
+                        "file_name": opened.get("file_name") or source["source"],
                     }
                 except Exception as exc:
                     st.error(f"原文打开失败：{exc}")
 
             current = st.session_state.get("preview")
             if current and current.get("key") == preview_key:
-                st.caption(f"原文位置：{current['location']}，黄色部分为关键句")
-                components.html(
-                    current["html"]
-                    + "<script>const el=document.getElementById('active-highlight');"
-                      "if(el){el.scrollIntoView({block:'center'});}</script>",
-                    height=560,
-                    scrolling=True,
-                )
+                if current.get("notice"):
+                    st.warning(current["notice"])
+                if current.get("using_saved_text"):
+                    st.caption("当前显示问答时已经保存的来源切片；未重新识别扫描页。")
+                if current.get("html"):
+                    st.caption(f"原文位置：{current['location']}，黄色部分为关键句")
+                    components.html(
+                        current["html"]
+                        + "<script>const el=document.getElementById('active-highlight');"
+                          "if(el){el.scrollIntoView({block:'center'});}</script>",
+                        height=560,
+                        scrolling=True,
+                    )
+                if current.get("file_bytes"):
+                    st.download_button(
+                        f"下载原始 PDF（{current['location']}）",
+                        data=current["file_bytes"],
+                        file_name=current["file_name"],
+                        mime="application/pdf",
+                        key=f"download_source_{record_id}_{source['id']}",
+                    )
                 if st.button("关闭原文", key=f"close_{record_id}_{source['id']}"):
                     st.session_state.pop("preview", None)
                     st.rerun()

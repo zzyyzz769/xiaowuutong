@@ -380,6 +380,15 @@ def get_rag(llm_model: str, embedding_model: str, base_url: str) -> CampusRAG:
     )
 
 
+@st.cache_data(ttl=5, show_spinner=False)
+def get_installed_models(base_url: str) -> tuple[list[str], str]:
+    """短时间缓存本机模型列表，避免每次界面刷新都请求 Ollama。"""
+    try:
+        return CampusRAG.list_ollama_models(base_url), ""
+    except Exception as exc:
+        return [], str(exc)
+
+
 def role_text(role: str) -> str:
     return ROLE_NAMES.get(role, role)
 
@@ -672,20 +681,43 @@ with st.sidebar:
     st.divider()
 
     with st.expander("本地模型设置"):
+        base_url = st.text_input("Ollama 地址", value="http://localhost:11434")
+        installed_models, model_check_error = get_installed_models(base_url)
+        answer_models = [
+            name for name in installed_models
+            if "embed" not in name.lower() and name.lower() not in {"bge-m3", "bge-m3:latest"}
+        ]
+        preferred_models = ["qwen2.5:7b", "qwen2.5:3b", "qwen:1.8b"]
+        model_options = preferred_models + [
+            name for name in answer_models if name not in preferred_models
+        ]
+        if "qwen2.5:7b" in answer_models:
+            default_model = "qwen2.5:7b"
+        elif "qwen2.5:3b" in answer_models:
+            default_model = "qwen2.5:3b"
+        else:
+            default_model = answer_models[0] if answer_models else "qwen2.5:7b"
         llm_model = st.selectbox(
             "本地回答模型",
-            ["qwen2.5:7b", "qwen2.5:3b", "qwen:1.8b"],
-            index=0,
+            model_options,
+            index=model_options.index(default_model),
             on_change=on_model_change,
         )
+        if model_check_error:
+            st.warning("没有读取到本机模型列表。请先启动 Ollama；启动后页面会自动重新检测。")
+        elif not answer_models:
+            st.warning("本机还没有可用的回答模型。可先运行 ollama pull qwen2.5:3b，再刷新页面。")
+        elif llm_model not in answer_models:
+            st.warning(f"模型“{llm_model}”尚未安装，请运行 ollama pull {llm_model}，或选择上方已安装模型。")
+        else:
+            st.caption(f"已检测到本机模型“{llm_model}”，可直接使用。")
         if llm_model == "qwen2.5:7b":
-            st.caption("推荐：总结和理解追问的效果更好，需要较多内存。首次使用前运行 ollama pull qwen2.5:7b。")
+            st.caption("推荐：总结和理解追问的效果更好，需要较多内存。")
         elif llm_model == "qwen2.5:3b":
             st.caption("低配置备用：占用资源较少，但总结能力弱于 7b。")
-        else:
+        elif llm_model == "qwen:1.8b":
             st.caption("仅作旧版兼容，更容易重复或漏答，不建议日常使用。")
         embedding_model = st.text_input("嵌入模型", value="bge-m3")
-        base_url = st.text_input("Ollama 地址", value="http://localhost:11434")
         st.caption("更换嵌入模型后，需要重新向量化全部现有文档。")
         rag = get_rag(llm_model, embedding_model, base_url)
 

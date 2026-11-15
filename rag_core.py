@@ -13,6 +13,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -61,6 +62,8 @@ QUERY_EXPANSIONS = {
     "退学": "退学 学籍 申请 审批",
     "转专业": "转专业 专业 申请 条件 考核",
     "奖学金": "奖学金 评定 申请 条件 金额",
+    "优秀学生": "优秀学生 评优 评选 条件 标准 成绩 要求 比例",
+    "评优": "评优 优秀学生 评选 条件 标准 成绩 要求",
     "助学金": "助学金 困难认定 申请 材料",
     "请假": "请假 销假 审批 辅导员",
     "选课": "选课 退课 补选 学分",
@@ -75,6 +78,8 @@ CORE_SYNONYMS = {
     "退学": ("退学",),
     "转专业": ("转专业", "调整专业"),
     "奖学金": ("奖学金",),
+    "优秀学生": ("优秀学生", "校级优秀学生", "评优"),
+    "评优": ("评优", "优秀学生", "评选"),
     "助学金": ("助学金",),
     "请假": ("请假",),
     "选课": ("选课",),
@@ -139,6 +144,38 @@ class CampusRAG:
     @staticmethod
     def _now() -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    @staticmethod
+    def list_ollama_models(base_url: str) -> list[str]:
+        """读取本机 Ollama 已安装模型，不下载模型，也不调用在线生成服务。"""
+        url = base_url.strip().rstrip("/") + "/api/tags"
+        with urllib.request.urlopen(url, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return sorted({
+            str(item.get("name", "")).strip()
+            for item in payload.get("models", [])
+            if str(item.get("name", "")).strip()
+        })
+
+    def _generation_failure_notice(self, exc: Exception) -> str:
+        """把常见模型错误转成用户能直接处理的说明。"""
+        message = str(exc)
+        compact = message.lower()
+        if "not found" in compact and ("404" in compact or "status code" in compact):
+            return (
+                f"本机尚未安装回答模型“{self.llm_model}”。请在终端运行 "
+                f"“ollama pull {self.llm_model}”，或在左侧“本地模型设置”选择已安装模型。"
+                "本次只整理资料中的证据句，没有调用在线模型。"
+            )
+        if "connection" in compact or "connect" in compact or "拒绝" in message:
+            return (
+                "暂时无法连接本机 Ollama。请先启动 Ollama，再重新提问。"
+                "本次只整理资料中的证据句，没有调用在线模型。"
+            )
+        return (
+            "本地总结模型暂时不可用，本次已改为整理资料中的证据句。"
+            f"错误信息：{message[:240]}"
+        )
 
     @staticmethod
     def _role(actor: dict[str, str]) -> str:
@@ -1103,6 +1140,11 @@ class CampusRAG:
             compact = re.sub(r"\s+", "", sentence)
             value = sum(3 if len(token) > 2 else 2 for token in query_tokens if token in compact)
             value += sum(8 for term in search_terms if term in compact)
+            if any(term in question for term in ("如何", "怎么", "怎样", "条件", "评上", "评选", "申请")):
+                value += sum(
+                    3 for term in ("条件", "标准", "要求", "具备", "成绩", "表现", "评定", "评选")
+                    if term in compact
+                )
             return value
 
         best_index = max(range(len(sentences)), key=lambda i: score(sentences[i]))
@@ -1117,7 +1159,7 @@ class CampusRAG:
         selected = [sentences[i] for i in sorted(chosen)]
         evidence = " …… ".join(selected)
         if len(evidence) > 360:
-            evidence = sentences[best_index][:357] + "……"
+            evidence = self._complete_excerpt(sentences[best_index], 360)
         compact_text = re.sub(r"\s+", "", text)
         matched = sorted(
             {token for token in query_tokens if token in compact_text} |
@@ -1177,26 +1219,50 @@ class CampusRAG:
         return text.strip()
 
     @staticmethod
+    def _complete_excerpt(text: str, limit: int = 240) -> str:
+        """优先保留完整句子；limit 是软上限，不把条款从半句话中间切断。"""
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(text) <= limit:
+            return text
+        sentences = [
+            part.strip()
+            for part in re.split(r"(?<=[。！？；])", text)
+            if part.strip(" ……")
+        ]
+        chosen = ""
+        for sentence in sentences:
+            addition = sentence if not chosen else " …… " + sentence
+            if chosen and len(chosen + addition) > limit:
+                break
+            if not chosen and len(sentence) > limit:
+                # 单条完整规定可能较长，保留整句比截断条件或比例更有用。
+                return sentence if len(sentence) <= 420 else sentence[:417].rstrip() + "……"
+            chosen += addition
+        return chosen.strip() or text[:limit].rstrip() + "……"
+
+    @staticmethod
     def _fallback_answer(question: str, sources: list[dict[str, Any]]) -> str:
-        """指令模型输出失控时，退回为严格来自证据句的简明摘要。"""
-        topic = re.sub(r"\s+", " ", question).strip()[:60]
+        """模型不可用时，按完整证据句整理，不编造条件、比例或办理结论。"""
         points = []
+        seen = set()
         for source in sources[:4]:
-            evidence = CampusRAG.clean_answer(
-                source.get("evidence") or source.get("content") or ""
-            )
-            evidence = re.sub(r"\s+", " ", evidence).strip()
-            if len(evidence) > 180:
-                shortened = evidence[:180]
-                end = max(shortened.rfind(mark) for mark in ("。", "；", "！"))
-                evidence = shortened[:end + 1] if end >= 60 else shortened.rstrip() + "……"
-            if evidence:
-                points.append(f"{len(points) + 1}. {evidence}[资料{source['id']}]")
+            raw_evidence = source.get("evidence") or source.get("content") or ""
+            if not str(raw_evidence).strip():
+                continue
+            evidence = CampusRAG.clean_answer(raw_evidence)
+            evidence = CampusRAG._complete_excerpt(evidence, 240)
+            evidence = re.sub(r"(?:\s*……)+\s*$", "", evidence).strip()
+            fingerprint = re.sub(r"\W+", "", evidence)
+            if not evidence or not fingerprint or fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            points.append(f"{len(points) + 1}. {evidence}[资料{source['id']}]")
         if not points:
             return "未从命中文档中提取到可展示的规定，请打开来源原文核对。"
         return (
-            f"**一句话结论**：以下是资料中与“{topic}”最直接相关的内容。\n\n"
+            "**一句话结论**：已将资料中的相关规定按原文整理如下，具体以对应条款为准。\n\n"
             "**具体要点**：\n" + "\n".join(points)
+            + "\n\n**注意**：当前是证据句整理，完整条件和适用范围请打开来源原文核对。"
         )
 
     def retrieve(
@@ -1355,16 +1421,34 @@ class CampusRAG:
     def _resolve_question(
         self, question: str, history: list[dict[str, str]] | None
     ) -> str:
-        """把简短追问补全为独立检索问题；失败时使用保守的原文拼接。"""
+        """只改写真正的上下文追问；重复提问和新的短问题保持原文。"""
+        question = question.strip()
         history = (history or [])[-2:]
         if not history:
-            return question
-        followup_markers = ("那", "它", "这个", "这项", "还", "呢", "材料", "条件", "流程")
-        if len(question) > 18 and not any(marker in question for marker in followup_markers):
             return question
         previous = str(history[-1].get("question", "")).strip()
         if not previous:
             return question
+
+        def normalized(value: str) -> str:
+            return re.sub(r"[\s，。！？!?；;：:]", "", value)
+
+        if normalized(question) == normalized(previous) or previous in question:
+            return question
+        compact = normalized(question)
+        vague = {"怎么办", "怎么弄", "怎么申请", "如何办理", "需要什么材料", "要什么条件"}
+        specific_topic = any(key in question for key in QUERY_EXPANSIONS) or any(
+            term in question for term in ("优秀学生", "评优", "课表", "空教室")
+        )
+        explicit_followup = bool(re.match(r"^(那么|那|这个|这项|它|该|还|另外)", compact))
+        generic_followup = compact in vague or compact.endswith("呢") or (
+            len(compact) <= 12
+            and not specific_topic
+            and any(term in compact for term in ("材料", "条件", "流程", "时间", "地点", "费用"))
+        )
+        if specific_topic or not (explicit_followup or generic_followup):
+            return question
+
         prompt = f"""把最新追问改写成一个可独立检索的完整问题。保留上一问的具体事项，不回答，不解释，只输出一行问题。
 上一问：{previous}
 最新追问：{question}
@@ -1377,7 +1461,9 @@ class CampusRAG:
                 return candidate
         except Exception:
             pass
-        return f"{previous}；追问：{question}"
+        # 模型不可用时不重复上一问，也不显示机械的“追问：”拼接标记。
+        shortened = re.sub(r"^(那么|那|这个|这项|它|该|还|另外)", "", question).strip("，,。 ")
+        return f"{previous}，{shortened or question}"
 
     def _answer_trust(
         self, sources: list[dict[str, Any]], retrieval_confidence: int
@@ -1513,9 +1599,7 @@ class CampusRAG:
                 raw_answer = str(self.llm.invoke(prompt)).strip()
             except Exception as exc:
                 raw_answer = ""
-                generation_notice = (
-                    f"总结模型暂时不可用，本次已改为直接整理证据句：{exc}"
-                )
+                generation_notice = self._generation_failure_notice(exc)
             answer = self.clean_answer(raw_answer)
             severely_repeated = (
                 len(raw_answer) >= 160 and len(answer) <= len(raw_answer) * 0.55

@@ -2,6 +2,7 @@
 
 import hashlib
 import html
+import re
 from datetime import date, datetime, time
 
 import streamlit as st
@@ -285,6 +286,43 @@ st.markdown(
     .schedule-preview-table th { background: #eef4fb; color: #263445; font-weight: 650; text-align: left; }
     .schedule-preview-table th, .schedule-preview-table td { padding: 9px 10px; border-bottom: 1px solid var(--campus-line); white-space: nowrap; }
     .schedule-preview-table tr:last-child td { border-bottom: 0; }
+    .week-schedule-wrap {
+        overflow-x: auto; border: 1px solid var(--campus-line); border-radius: 12px;
+        background: #ffffff; box-shadow: 0 4px 16px rgba(37,42,49,.035);
+    }
+    .week-schedule {
+        width: 100%; min-width: 1080px; border-collapse: separate; border-spacing: 0;
+        table-layout: fixed; background: #ffffff; color: var(--campus-ink);
+    }
+    .week-schedule th, .week-schedule td {
+        border-right: 1px solid #e2e7ed; border-bottom: 1px solid #e2e7ed;
+        padding: 8px; text-align: center; vertical-align: middle;
+    }
+    .week-schedule tr:last-child th, .week-schedule tr:last-child td { border-bottom: 0; }
+    .week-schedule th:last-child, .week-schedule td:last-child { border-right: 0; }
+    .week-schedule thead th {
+        position: sticky; top: 0; z-index: 2; background: #eef4fb; color: #263445;
+        padding: 12px 8px; font-size: .9rem; font-weight: 650;
+    }
+    .week-schedule thead th:first-child {
+        left: 0; z-index: 4; width: 112px; min-width: 112px;
+    }
+    .week-schedule thead th.today { background: #dceaff; color: #0053bd; }
+    .week-schedule tbody td { min-height: 104px; height: 112px; vertical-align: top; }
+    .week-schedule .period-cell {
+        position: sticky; left: 0; z-index: 1; width: 112px; min-width: 112px;
+        background: #f8fafc; vertical-align: middle;
+    }
+    .week-schedule .period-cell strong { display: block; color: #334155; font-size: .88rem; }
+    .week-schedule .period-cell small { display: block; margin-top: 7px; color: #6b7684; line-height: 1.55; }
+    .week-course {
+        margin: 0 0 7px; padding: 9px 8px; border-left: 3px solid #3b82f6;
+        border-radius: 6px; background: #edf5ff; text-align: left; color: #252a31;
+    }
+    .week-course:last-child { margin-bottom: 0; }
+    .week-course strong { display: block; color: #174f96; font-size: .88rem; line-height: 1.5; }
+    .week-course span { display: block; margin-top: 3px; color: #5c6673; font-size: .74rem; line-height: 1.45; }
+    .week-empty { color: #c1c8d0; }
     [data-testid="stChatMessage"] { background: var(--campus-paper); color: var(--campus-ink); }
     div[data-testid="stChatInput"] {
         position: sticky; bottom: 0; z-index: 20; background: var(--campus-canvas) !important;
@@ -357,6 +395,90 @@ def plain_answer(text: str) -> str:
     return rag.clean_answer(text).replace("**", "").strip()
 
 
+def render_weekly_schedule(
+    schedule: list[dict], period_times: dict[str, list[str]] | None = None
+) -> None:
+    """把课程清单整理成左侧节次、顶部星期的周课表，并使用个人作息。"""
+    if period_times is None:
+        period_times = {
+            str(section): list(CampusRAG._schedule_section_times((section, section)))
+            for section in range(1, 13)
+        }
+    slots = [
+        (
+            f"{first}—{first + 1}",
+            period_times[str(first)][0], period_times[str(first + 1)][1],
+        )
+        for first in (1, 3, 5, 7, 9, 11)
+    ]
+
+    def minutes(value: str) -> int:
+        hour, minute = str(value).split(":", 1)
+        return int(hour) * 60 + int(minute)
+
+    grid: dict[str, dict[int, list[dict]]] = {
+        slot[0]: {day: [] for day in range(1, 8)} for slot in slots
+    }
+    grid["其他时间"] = {day: [] for day in range(1, 8)}
+    for item in schedule:
+        start, end = minutes(item["start_time"]), minutes(item["end_time"])
+        best_slot, best_overlap = "其他时间", 0
+        for label, slot_start, slot_end in slots:
+            overlap = max(0, min(end, minutes(slot_end)) - max(start, minutes(slot_start)))
+            if overlap > best_overlap:
+                best_slot, best_overlap = label, overlap
+        grid[best_slot][int(item["weekday"])].append(item)
+
+    today = datetime.now().isoweekday()
+    headers = "".join(
+        f"<th class='{'today' if day == today else ''}'>星期{'一二三四五六日'[day - 1]}</th>"
+        for day in range(1, 8)
+    )
+    body_rows = []
+    for label, slot_start, slot_end in slots + [("其他时间", "", "")]:
+        cells = []
+        for day in range(1, 8):
+            courses = grid[label][day]
+            if not courses:
+                cells.append("<td><span class='week-empty'>—</span></td>")
+                continue
+            course_cards = []
+            for item in courses:
+                details = [f"{html.escape(item['start_time'])}—{html.escape(item['end_time'])}"]
+                if item.get("location"):
+                    details.append(html.escape(item["location"]))
+                if item.get("teacher"):
+                    details.append("教师：" + html.escape(item["teacher"]))
+                week_kind = {"all": "每周", "odd": "单周", "even": "双周"}.get(
+                    item.get("week_type", "all"), "每周"
+                )
+                details.append(
+                    f"{item.get('start_week', 1)}—{item.get('end_week', 53)}周 · {week_kind}"
+                )
+                course_cards.append(
+                    "<div class='week-course'>"
+                    f"<strong>{html.escape(item['course_name'])}</strong>"
+                    + "".join(f"<span>{detail}</span>" for detail in details)
+                    + "</div>"
+                )
+            cells.append("<td>" + "".join(course_cards) + "</td>")
+        time_label = f"<small>{slot_start}<br>{slot_end}</small>" if slot_start else "<small>按原时间</small>"
+        body_rows.append(
+            f"<tr><th class='period-cell'><strong>第{label}节</strong>{time_label}</th>"
+            if label != "其他时间" else
+            f"<tr><th class='period-cell'><strong>{label}</strong>{time_label}</th>"
+        )
+        body_rows[-1] += "".join(cells) + "</tr>"
+    st.markdown(
+        "<div class='week-schedule-wrap'><table class='week-schedule'>"
+        f"<thead><tr><th>节次</th>{headers}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+    if any(grid["其他时间"].values()):
+        st.caption("无法对应个人作息节次的课程已放在“其他时间”行，课程原始时间保持不变。")
+
+
 def show_moderation_result(result: dict, success_text: str = "发布成功。") -> None:
     status = result.get("status", "visible")
     if status in {"visible", "delivered"}:
@@ -410,6 +532,8 @@ st.caption("本地智能校务 · 校园社区 · 学习与生活服务")
 if not st.session_state.user:
     _, login_column, _ = st.columns([0.45, 1.1, 0.45])
     with login_column:
+        if st.session_state.get("login_notice"):
+            st.info(st.session_state.pop("login_notice"))
         with st.container(border=True):
             st.markdown(
                 "<div class='login-panel'><div class='login-kicker'>欢迎回来</div>"
@@ -423,13 +547,18 @@ if not st.session_state.user:
                 password = st.text_input("密码", type="password", placeholder="请输入密码")
                 submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
             if submitted:
-                user = rag.authenticate(username, password)
-                if user:
-                    st.session_state.user = user
-                    st.session_state.pop("qa_csv", None)
-                    st.rerun()
-                else:
-                    st.error("用户名或密码错误。")
+                try:
+                    authenticated = rag.authenticate(username, password)
+                    if authenticated:
+                        st.session_state.user = authenticated
+                        st.session_state.pop("qa_csv", None)
+                        st.rerun()
+                    else:
+                        st.error("用户名或密码错误。连续失败 5 次会锁定 5 分钟。")
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"登录暂时失败：{exc}")
         with st.expander("首次运行的本地演示账户"):
             st.code(
                 "学生：student / Student@123\n"
@@ -441,14 +570,41 @@ if not st.session_state.user:
 
 user = st.session_state.user
 
+if user.get("must_change_password"):
+    _, password_column, _ = st.columns([0.35, 1.3, 0.35])
+    with password_column:
+        with st.container(border=True):
+            st.subheader("首次登录，请先修改默认密码")
+            st.caption("为了保护本机账户，修改完成后才能进入其他功能。新密码至少 8 位，且不能与默认密码相同。")
+            with st.form("required_password_form"):
+                old_password = st.text_input("当前默认密码", type="password")
+                new_password = st.text_input("新密码（至少 8 位）", type="password")
+                confirm_password = st.text_input("再次输入新密码", type="password")
+                submitted = st.form_submit_button("修改密码并进入系统", type="primary", use_container_width=True)
+            if submitted:
+                if new_password != confirm_password:
+                    st.error("两次输入的新密码不一致。")
+                else:
+                    try:
+                        rag.change_password(user, old_password, new_password)
+                        st.session_state.user["must_change_password"] = False
+                        st.session_state.password_changed_notice = True
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"修改失败：{exc}")
+        if st.button("退出登录", key="required_password_logout", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
+    st.stop()
+
 nav_groups = {
     "智能校务": ["工作台", "教务问答", "办事向导"],
-    "校园生活": ["校园社区", "校园服务"],
+    "校园生活": ["消息中心", "校园社区", "校园服务"],
     "知识管理": ["我的知识库", "知识治理", "评测中心", "版本对比"],
     "运营管理": ["数据看板"],
 }
 if user["role"] == "admin":
-    nav_groups["运营管理"] += ["文档管理", "自动诊断", "审计日志"]
+    nav_groups["运营管理"] += ["文档管理", "自动诊断", "审计日志", "系统维护"]
 
 # 页面按钮在侧栏控件之后执行，因此先暂存目标，在下一次脚本运行、控件创建前应用。
 pending_navigation = st.session_state.pop("pending_navigation", None)
@@ -472,6 +628,7 @@ def open_page(target: str, subpage: str = "") -> None:
 
 page_descriptions = {
     "工作台": "常用入口、今日安排和最近动态，一眼找到下一步要做的事。",
+    "消息中心": "集中查看私信、评论回复、活动报名和内容审核结果。",
     "教务问答": "从权限范围内的制度中找依据，给出结论、要点和可信来源。",
     "办事向导": "把条件、材料、步骤和时间整理成一份可以勾选的办理清单。",
     "校园社区": "论坛交流、失物招领、二手交易、树洞和站内私信。",
@@ -484,7 +641,10 @@ page_descriptions = {
     "文档管理": "批量导入、预检、重建索引并维护制度版本。",
     "自动诊断": "检查权限隔离、索引一致性和检索服务。",
     "审计日志": "查看角色访问记录并导出脱敏日志。",
+    "系统维护": "备份或恢复本机完整数据，并添加或清除明确标注的演示内容。",
 }
+
+unread_count = rag.get_unread_count(user)
 
 with st.sidebar:
     st.markdown(
@@ -494,6 +654,8 @@ with st.sidebar:
     )
     allowed_names = "、".join(GROUPS[g] for g in ROLE_ACCESS[user["role"]])
     st.caption(f"当前可访问：{allowed_names}")
+    if unread_count:
+        st.info(f"消息中心有 {unread_count} 条未读消息")
     st.markdown("<div class='section-kicker'>功能导航</div>", unsafe_allow_html=True)
     nav_group = st.selectbox(
         "功能分区", list(nav_groups), key="nav_group", label_visibility="collapsed"
@@ -501,7 +663,11 @@ with st.sidebar:
     if st.session_state.get("nav_page") not in nav_groups[nav_group]:
         st.session_state.nav_page = nav_groups[nav_group][0]
     page = st.radio(
-        "选择功能", nav_groups[nav_group], key="nav_page", label_visibility="collapsed"
+        "选择功能", nav_groups[nav_group], key="nav_page", label_visibility="collapsed",
+        format_func=lambda name: (
+            f"{name}（{unread_count} 条未读）"
+            if name == "消息中心" and unread_count else name
+        ),
     )
     st.divider()
 
@@ -553,6 +719,21 @@ with st.sidebar:
         )
         st.caption("已嵌入当前账户的零宽溯源水印")
 
+    if st.button("导出我的全部记录", use_container_width=True):
+        try:
+            with st.spinner("正在整理个人课表、问答和活动记录……"):
+                st.session_state.personal_export = rag.export_personal_data(user)
+            st.success("个人数据包已生成。")
+        except Exception as exc:
+            st.error(f"导出失败：{exc}")
+    if st.session_state.get("personal_export"):
+        st.download_button(
+            "下载个人数据 ZIP", data=st.session_state.personal_export,
+            file_name=f"校务通_{user['username']}_个人数据.zip", mime="application/zip",
+            use_container_width=True,
+        )
+        st.caption("只含自己的课表、问答和活动报名，不含其他用户资料。")
+
     with st.expander("修改密码"): 
         with st.form("password_form"):
             old_password = st.text_input("原密码", type="password")
@@ -561,6 +742,7 @@ with st.sidebar:
         if change:
             try:
                 rag.change_password(user, old_password, new_password)
+                st.session_state.user["must_change_password"] = False
                 st.success("密码已修改。")
             except Exception as exc:
                 st.error(str(exc))
@@ -633,13 +815,61 @@ def show_sources(sources: list[dict], record_id: int) -> None:
             st.divider()
 
 
+def render_study_plan(plan_text: str) -> None:
+    """把模型返回的表格和文字分开渲染，避免动态 Markdown 表格引发 React 节点冲突。"""
+    lines = str(plan_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    table_start = next(
+        (
+            index
+            for index in range(len(lines) - 1)
+            if lines[index].strip().startswith("|")
+            and lines[index].strip().endswith("|")
+            and lines[index + 1].strip().startswith("|")
+            and re.fullmatch(
+                r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?",
+                lines[index + 1].strip(),
+            )
+        ),
+        None,
+    )
+    if table_start is None:
+        st.text(str(plan_text or "没有可显示的规划内容。"))
+        return
+
+    table_end = table_start + 2
+    while table_end < len(lines):
+        line = lines[table_end].strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            break
+        table_end += 1
+
+    def split_row(line: str) -> list[str]:
+        return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+    headers = split_row(lines[table_start])
+    rows = [split_row(line) for line in lines[table_start + 2:table_end]]
+    rows = [row[:len(headers)] + [""] * max(0, len(headers) - len(row)) for row in rows]
+    before = "\n".join(lines[:table_start]).strip()
+    after = "\n".join(lines[table_end:]).strip()
+    if before:
+        st.text(before)
+    if headers and rows:
+        st.table([dict(zip(headers, row)) for row in rows])
+    if after:
+        st.text(after)
+
+
 def show_answer_meta(record: dict) -> None:
     confidence = int(record.get("confidence", 0))
     mode_names = {"hybrid": "混合", "vector": "纯向量", "bm25": "纯 BM25"}
     mode = mode_names.get(record.get("retrieval_mode"), record.get("retrieval_mode") or "旧版")
     rerank = "＋Rerank" if record.get("rerank_used") else ""
+    latency_ms = int(record.get("latency_ms", 0) or 0)
+    latency_text = (
+        f" · 实际耗时 {latency_ms / 1000:.2f} 秒" if latency_ms else " · 旧记录未保存耗时"
+    )
     st.caption(
-        f"{record['created_at']} · {record.get('model') or '旧版模型'} · {mode}{rerank}"
+        f"{record['created_at']} · {record.get('model') or '旧版模型'} · {mode}{rerank}{latency_text}"
     )
     st.progress(confidence / 100, text=f"检索匹配置信度：{confidence}/100")
     if confidence < 60:
@@ -696,11 +926,16 @@ st.markdown(
 )
 
 if page == "工作台":
+    if st.session_state.pop("password_changed_notice", False):
+        st.success("密码已修改，请妥善保管新密码。")
     try:
         stats = rag.get_stats(user)
     except Exception:
         stats = {"documents": 0, "today_qa": 0}
-    today_courses = rag.get_schedule(user, date.today().isoweekday())
+    workbench_settings = rag.get_user_settings(user)
+    today_courses = rag.get_schedule(
+        user, date.today().isoweekday(), week=workbench_settings["current_week"]
+    )
     active_activities = sum(a["status"] == "published" for a in rag.get_activities(user))
     overview = st.columns(4)
     overview[0].metric("可访问文档", stats.get("documents", 0))
@@ -709,19 +944,37 @@ if page == "工作台":
     overview[3].metric("进行中活动", active_activities)
 
     st.markdown("<div class='section-kicker'>常用功能</div>", unsafe_allow_html=True)
-    quick_items = [
+    all_quick_items = [
         ("教务问答", "查制度、问流程，直接查看结论和原文依据。", "去问一个问题", ""),
         ("办事向导", "把办事条件、材料和步骤整理成清单。", "生成办理清单", ""),
         ("校园社区", "查看论坛热议、失物招领和二手信息。", "进入校园论坛", "校园论坛"),
         ("校园服务", "查看今日课表、下一节课和空教室参考。", "打开我的课表", "我的课表"),
+        ("消息中心", "查看私信、评论回复、活动和审核结果。", "查看我的消息", ""),
     ]
-    quick_cols = st.columns(4)
+    favorites = workbench_settings.get("favorites", [])
+    quick_items = (
+        [item for item in all_quick_items if item[0] in favorites]
+        if favorites else all_quick_items[:4]
+    )
+    quick_cols = st.columns(min(4, len(quick_items)))
     for index, (target, copy, button_text, subpage) in enumerate(quick_items):
-        with quick_cols[index]:
+        with quick_cols[index % len(quick_cols)]:
             with st.container(border=True):
                 st.markdown(f"<div class='quick-title'>{target}</div><div class='quick-copy'>{copy}</div>", unsafe_allow_html=True)
-                if st.button(button_text, key=f"quick_{index}", use_container_width=True):
+                if st.button(button_text, key=f"quick_{target}", use_container_width=True):
                     open_page(target, subpage)
+    with st.expander("收藏我常用的功能"):
+        st.caption("最多收藏 5 项；保存后，工作台只显示这些入口。取消全部收藏即可恢复默认四项。")
+        selected_favorites = st.multiselect(
+            "常用功能", [item[0] for item in all_quick_items], default=favorites,
+            key="workbench_favorites",
+        )
+        if st.button("保存常用功能", key="save_workbench_favorites"):
+            if len(selected_favorites) > 5:
+                st.error("最多收藏 5 项。")
+            else:
+                rag.set_favorites(user, selected_favorites)
+                st.rerun()
 
     st.markdown("<div class='section-kicker'>今日动态</div>", unsafe_allow_html=True)
     recent_col, schedule_col = st.columns([1.25, 1])
@@ -894,6 +1147,42 @@ if page == "办事向导":
                     key=f"download_guide_{guide_key}",
                 )
             show_sources(guide.get("sources", []), f"guide_{guide_key}")
+
+if page == "消息中心":
+    st.subheader("我的站内消息")
+    st.caption("私信、评论回复、活动报名和审核结果会集中出现在这里。消息只保存在本机；点击消息可标记已读并前往对应功能。")
+    notifications = rag.get_notifications(user)
+    header_cols = st.columns([3, 1])
+    header_cols[0].write(f"共 {len(notifications)} 条消息，其中 {unread_count} 条未读。")
+    if header_cols[1].button(
+        "全部标为已读", use_container_width=True, disabled=not unread_count
+    ):
+        rag.mark_all_notifications_read(user)
+        st.rerun()
+    if not notifications:
+        st.info("暂时没有消息。收到私信、评论回复或审核结果后会在这里显示。")
+    for notice in notifications:
+        is_unread = not notice.get("read_at")
+        with st.container(border=True):
+            title = ("【未读】" if is_unread else "") + notice["title"]
+            st.markdown(f"**{html.escape(title)}**")
+            st.caption(f"{notice['kind']} · {notice['created_at']}" + (" · 未读" if is_unread else " · 已读"))
+            if notice.get("content"):
+                st.write(notice["content"])
+            if notice.get("link"):
+                if st.button(
+                    "查看并前往相关页面" if is_unread else "再次查看相关页面",
+                    key=f"open_notification_{notice['id']}",
+                ):
+                    if is_unread:
+                        rag.mark_notification_read(user, int(notice["id"]))
+                    target, _, subpage = notice["link"].partition("|")
+                    if target == "消息中心":
+                        st.rerun()
+                    open_page(target, subpage)
+            elif is_unread and st.button("标为已读", key=f"read_notification_{notice['id']}"):
+                rag.mark_notification_read(user, int(notice["id"]))
+                st.rerun()
 
 if page == "校园社区":
     community_names = ["校园论坛", "失物招领", "二手交易", "心情树洞", "站内私信"]
@@ -1161,7 +1450,55 @@ if page == "校园服务":
 
     if service_page == "我的课表":
         st.subheader("课表、上课提醒与空教室参考")
-        st.caption("可手动录入或批量导入每周重复课程。提醒按本机时间计算，只在打开本页面时显示，不会发送系统推送；空教室只根据大家已录入的课表估算，不是学校教务处的实时教室数据。")
+        st.caption("可手动录入或批量导入课程，支持周次、单双周、编辑和冲突检查。提醒按本机时间计算，只在打开本页面时显示，不会发送系统推送；空教室只根据已录入课表估算，不是学校教务处的实时教室数据。")
+        schedule_settings = rag.get_user_settings(user)
+        if st.session_state.get("schedule_clear_notice"):
+            st.success(st.session_state.pop("schedule_clear_notice"))
+        with st.expander("当前周、学期与个人作息设置"): 
+            st.caption("当前周用于计算今天和下一节课；作息只用于节次换算与网格展示，是你自己的参考设置，不是学校官方作息。")
+            with st.form("schedule_settings_form"):
+                setting_cols = st.columns(2)
+                current_week = setting_cols[0].number_input(
+                    "当前是第几周", min_value=1, max_value=53,
+                    value=int(schedule_settings["current_week"]),
+                )
+                semester = setting_cols[1].text_input(
+                    "学期名称（可选）", value=schedule_settings.get("semester", ""),
+                    placeholder="例如：2026 春季学期", max_chars=40,
+                )
+                period_rows = [
+                    {"节次": section, "开始时间": schedule_settings["period_times"][str(section)][0],
+                     "结束时间": schedule_settings["period_times"][str(section)][1]}
+                    for section in range(1, 13)
+                ]
+                edited_periods = st.data_editor(
+                    period_rows, key="period_times_editor", hide_index=True,
+                    use_container_width=True, disabled=["节次"],
+                    column_config={
+                        "节次": st.column_config.NumberColumn("节次"),
+                        "开始时间": st.column_config.TextColumn("开始时间（HH:MM）", required=True),
+                        "结束时间": st.column_config.TextColumn("结束时间（HH:MM）", required=True),
+                    },
+                )
+                if st.form_submit_button("保存当前周和作息", type="primary"):
+                    rows = (
+                        edited_periods.to_dict("records") if hasattr(edited_periods, "to_dict")
+                        else list(edited_periods)
+                    )
+                    period_times = {
+                        str(int(row["节次"])): [str(row["开始时间"]), str(row["结束时间"])]
+                        for row in rows
+                    }
+                    try:
+                        rag.update_schedule_settings(user, current_week, semester, period_times)
+                        st.success("设置已保存，按节次导入的课程时间也已同步更新。")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"保存失败：{exc}")
+        view_week = st.number_input(
+            "查看第几周的课表", min_value=1, max_value=53,
+            value=int(schedule_settings["current_week"]), key="schedule_view_week",
+        )
         upcoming = rag.get_upcoming_classes(user)
         if upcoming:
             next_class = upcoming[0]
@@ -1171,24 +1508,22 @@ if page == "校园服务":
             )
         else:
             st.caption("今天暂时没有尚未开始的已录入课程。")
-        schedule = rag.get_schedule(user)
+        all_schedule = rag.get_schedule(user)
+        schedule = rag.get_schedule(user, week=int(view_week))
+        conflicts = rag.get_schedule_conflicts(user, week=int(view_week))
+        if conflicts:
+            st.error(f"第 {int(view_week)} 周发现 {len(conflicts)} 组时间重叠，请检查课程安排。")
+            for conflict in conflicts:
+                st.warning(
+                    f"星期{'一二三四五六日'[conflict['weekday'] - 1]}："
+                    f"《{conflict['first']}》与《{conflict['second']}》在 {conflict['time']} 重叠。"
+                )
+        else:
+            st.caption(f"第 {int(view_week)} 周未发现已录入课程的时间重叠。")
         if schedule:
-            schedule_rows = "".join(
-                "<tr>"
-                f"<td>{item['id']}</td><td>{html.escape(item['course_name'])}</td>"
-                f"<td>{'一二三四五六日'[item['weekday'] - 1]}</td>"
-                f"<td>{html.escape(item['start_time'])}</td><td>{html.escape(item['end_time'])}</td>"
-                f"<td>{html.escape(item['location'])}</td><td>{html.escape(item['teacher'])}</td>"
-                "</tr>"
-                for item in schedule
-            )
-            st.markdown(
-                "<div class='schedule-preview-wrap'><table class='schedule-preview-table'>"
-                "<thead><tr><th>ID</th><th>课程</th><th>星期</th><th>开始</th><th>结束</th>"
-                "<th>地点</th><th>教师</th></tr></thead>"
-                f"<tbody>{schedule_rows}</tbody></table></div>",
-                unsafe_allow_html=True,
-            )
+            render_weekly_schedule(schedule, schedule_settings["period_times"])
+        elif all_schedule:
+            st.info(f"第 {int(view_week)} 周没有课程；可以切换周次查看其他安排。")
         else:
             st.info("还没有课程，请先手动添加或导入 CSV／PDF。")
         schedule_cols = st.columns(2)
@@ -1201,11 +1536,21 @@ if page == "校园服务":
                     end_time = st.time_input("结束时间", value=time(9, 40))
                     location = st.text_input("上课地点", max_chars=100)
                     teacher = st.text_input("教师（可选）", max_chars=60)
+                    week_cols = st.columns(3)
+                    start_week = week_cols[0].number_input("开始周", 1, 53, 1)
+                    end_week = week_cols[1].number_input("结束周", 1, 53, 16)
+                    week_type_label = week_cols[2].selectbox("上课周", ["每周", "单周", "双周"])
+                    course_semester = st.text_input(
+                        "学期（可选）", value=schedule_settings.get("semester", ""), max_chars=40
+                    )
                     if st.form_submit_button("添加课程", type="primary"):
                         try:
                             rag.add_schedule_entry(
                                 user, course_name, weekday, start_time.strftime("%H:%M"),
                                 end_time.strftime("%H:%M"), location, teacher,
+                                start_week=start_week, end_week=end_week,
+                                week_type={"每周": "all", "单周": "odd", "双周": "even"}[week_type_label],
+                                semester=course_semester,
                             )
                             st.success("课程已添加。")
                             st.rerun()
@@ -1221,14 +1566,17 @@ if page == "校园服务":
                     for error in notice.get("errors", []):
                         st.warning(error)
                 st.caption(
-                    "CSV 表头：课程、星期、开始时间、结束时间、地点、教师。PDF 会先显示识别结果，"
-                    "确认后才导入；重复课程自动跳过。扫描版 PDF 可尝试本地 OCR。"
+                    "CSV 必填：课程、星期、开始时间、结束时间；可选：地点、教师、开始周、结束周、单双周、学期、开始节次、结束节次。"
+                    "PDF 会先显示识别结果，确认后才导入；只有节次也可以导入，并标为参考时间。重复课程自动跳过，扫描版 PDF 可尝试本地 OCR。"
                 )
-                template = "课程,星期,开始时间,结束时间,地点,教师\n高等数学,1,08:00,09:40,教学楼A101,张老师\n"
+                template = (
+                    "课程,星期,开始时间,结束时间,地点,教师,开始周,结束周,单双周,学期,开始节次,结束节次\n"
+                    "高等数学,1,08:00,09:40,教学楼A101,张老师,1,16,每周,2026春季学期,1,2\n"
+                )
                 st.download_button("下载 CSV 课表模板", data=("\ufeff" + template).encode("utf-8"), file_name="校务通_课表模板.csv", mime="text/csv")
                 schedule_file = st.file_uploader(
                     "选择课表文件", type=["csv", "pdf"], key="schedule_import_file",
-                    help="PDF 建议包含清晰表格；只有节次、没有具体起止时间的课程需要先补充时间。",
+                    help="PDF 建议包含清晰表格；支持具体时间，也支持“第1—2节”等节次。",
                 )
                 if schedule_file and schedule_file.name.lower().endswith(".pdf"):
                     schedule_ocr = st.checkbox(
@@ -1268,8 +1616,11 @@ if page == "校园服务":
                                 f"<td>{'一二三四五六日'[item['weekday'] - 1]}</td>"
                                 f"<td>{html.escape(item['start_time'])}</td>"
                                 f"<td>{html.escape(item['end_time'])}</td>"
+                                f"<td>{html.escape(('第' + item.get('section_range', '') + '节（参考）') if item.get('time_source') == 'section' else 'PDF 原时间')}</td>"
                                 f"<td>{html.escape(item.get('location', ''))}</td>"
                                 f"<td>{html.escape(item.get('teacher', ''))}</td>"
+                                f"<td>{item.get('start_week', 1)}—{item.get('end_week', 53)}周 "
+                                f"{ {'all': '每周', 'odd': '单周', 'even': '双周'}.get(item.get('week_type', 'all'), '每周') }</td>"
                                 f"<td>{item.get('source_page', '')}</td>"
                                 "</tr>"
                                 for item in entries[:100]
@@ -1277,7 +1628,7 @@ if page == "校园服务":
                             st.markdown(
                                 "<div class='schedule-preview-wrap'><table class='schedule-preview-table'>"
                                 "<thead><tr><th>课程</th><th>星期</th><th>开始</th><th>结束</th>"
-                                "<th>地点</th><th>教师</th><th>PDF 页码</th></tr></thead>"
+                                "<th>节次／依据</th><th>地点</th><th>教师</th><th>周次</th><th>PDF 页码</th></tr></thead>"
                                 f"<tbody>{preview_rows}</tbody></table></div>",
                                 unsafe_allow_html=True,
                             )
@@ -1299,21 +1650,85 @@ if page == "校园服务":
                     if st.button("导入 CSV 课表", type="primary", use_container_width=True):
                         try:
                             imported = rag.import_schedule_csv(user, schedule_file.getvalue())
-                            st.session_state.schedule_import_notice = {
-                                **imported, "duplicates": 0,
-                            }
+                            st.session_state.schedule_import_notice = imported
                             st.rerun()
                         except Exception as exc:
                             st.error(f"导入失败：{exc}")
-        if schedule:
-            entry_map = {item["id"]: item for item in schedule}
-            delete_entry = st.selectbox(
-                "选择要删除的课程", list(entry_map),
-                format_func=lambda item_id: f"{entry_map[item_id]['course_name']} · 星期{'一二三四五六日'[entry_map[item_id]['weekday'] - 1]} {entry_map[item_id]['start_time']}",
+        if all_schedule:
+            entry_map = {item["id"]: item for item in all_schedule}
+            selected_entry_id = st.selectbox(
+                "选择要编辑或删除的课程", list(entry_map),
+                format_func=lambda item_id: (
+                    f"{entry_map[item_id]['course_name']} · "
+                    f"星期{'一二三四五六日'[entry_map[item_id]['weekday'] - 1]} "
+                    f"{entry_map[item_id]['start_time']} · "
+                    f"{entry_map[item_id].get('start_week', 1)}—{entry_map[item_id].get('end_week', 53)}周"
+                ),
+                key="schedule_action_entry",
             )
-            if st.button("删除所选课程"):
-                rag.delete_schedule_entry(user, delete_entry)
+            selected_entry = entry_map[selected_entry_id]
+            with st.expander("编辑所选课程"):
+                st.caption("可以修改课程、时间、地点、教师和周次。手动保存后，以这里填写的具体时间为准。")
+                with st.form(f"edit_schedule_{selected_entry_id}"):
+                    edit_name = st.text_input("课程名称", value=selected_entry["course_name"], max_chars=100)
+                    edit_day = st.selectbox(
+                        "星期", list(range(1, 8)), index=int(selected_entry["weekday"]) - 1,
+                        format_func=lambda value: "星期" + "一二三四五六日"[value - 1],
+                    )
+                    edit_time_cols = st.columns(2)
+                    edit_start = edit_time_cols[0].time_input(
+                        "开始时间", value=datetime.strptime(selected_entry["start_time"], "%H:%M").time()
+                    )
+                    edit_end = edit_time_cols[1].time_input(
+                        "结束时间", value=datetime.strptime(selected_entry["end_time"], "%H:%M").time()
+                    )
+                    edit_location = st.text_input("上课地点", value=selected_entry["location"], max_chars=100)
+                    edit_teacher = st.text_input("教师", value=selected_entry["teacher"], max_chars=60)
+                    edit_week_cols = st.columns(3)
+                    edit_start_week = edit_week_cols[0].number_input(
+                        "开始周", 1, 53, int(selected_entry.get("start_week", 1))
+                    )
+                    edit_end_week = edit_week_cols[1].number_input(
+                        "结束周", 1, 53, int(selected_entry.get("end_week", 53))
+                    )
+                    current_week_type = selected_entry.get("week_type", "all")
+                    edit_week_type = edit_week_cols[2].selectbox(
+                        "上课周", ["每周", "单周", "双周"],
+                        index={"all": 0, "odd": 1, "even": 2}.get(current_week_type, 0),
+                    )
+                    edit_semester = st.text_input(
+                        "学期", value=selected_entry.get("semester", ""), max_chars=40
+                    )
+                    if st.form_submit_button("保存课程修改", type="primary"):
+                        try:
+                            rag.update_schedule_entry(
+                                user, selected_entry_id, edit_name, edit_day,
+                                edit_start.strftime("%H:%M"), edit_end.strftime("%H:%M"),
+                                edit_location, edit_teacher, edit_start_week, edit_end_week,
+                                {"每周": "all", "单周": "odd", "双周": "even"}[edit_week_type],
+                                edit_semester,
+                            )
+                            st.success("课程已更新。")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"修改失败：{exc}")
+            action_cols = st.columns(2)
+            if action_cols[0].button("删除所选课程", use_container_width=True):
+                rag.delete_schedule_entry(user, selected_entry_id)
                 st.rerun()
+            with action_cols[1]:
+                with st.expander("清空课表并重新导入"):
+                    st.warning("会删除当前账户的全部课程，其他账户和文档不受影响。")
+                    confirm_clear = st.checkbox("我确认清空自己的全部课程", key="confirm_clear_schedule")
+                    if st.button(
+                        "确认清空全部课程", disabled=not confirm_clear, use_container_width=True
+                    ):
+                        removed = rag.clear_schedule(user)
+                        st.session_state.pop("schedule_pdf_preview", None)
+                        st.session_state.schedule_clear_notice = (
+                            f"已清空 {removed} 条课程，现在可以重新导入。"
+                        )
+                        st.rerun()
         st.markdown("**查询空教室参考**")
         with st.form("free_room_form"):
             room_cols = st.columns(3)
@@ -1418,7 +1833,7 @@ if page == "校园服务":
         if latest_plan:
             if latest_plan.get("notice"):
                 st.warning(latest_plan["notice"])
-            st.markdown(latest_plan["plan"])
+            render_study_plan(latest_plan["plan"])
             if latest_plan.get("sources"):
                 with st.expander("查看参考的本校资料"):
                     for source in latest_plan["sources"]:
@@ -1537,11 +1952,18 @@ if page == "数据看板":
     dashboard = st.session_state.get("dashboard_data")
     if dashboard:
         st.caption(f"数据范围：{dashboard['scope']} · 最近 {dashboard['days']} 天")
-        cols = st.columns(4)
+        cols = st.columns(5)
         cols[0].metric("提问总数", dashboard["total_questions"])
         cols[1].metric("找到资料", dashboard["answered"])
         cols[2].metric("找到资料比例", f"{dashboard['answer_rate'] * 100:.1f}%")
         cols[3].metric("平均参考可信度", f"{dashboard['average_trust']}/100")
+        average_latency = dashboard.get("average_latency_ms", 0)
+        cols[4].metric(
+            "平均实际耗时", f"{average_latency / 1000:.2f} 秒" if average_latency else "暂无记录"
+        )
+        st.caption(
+            f"耗时统计覆盖 {dashboard.get('latency_count', 0)} 条新记录；旧版问答没有耗时数据，不参与平均。"
+        )
         left, right = st.columns(2)
         with left:
             st.markdown("**热门问题 TOP10**")
@@ -1895,6 +2317,73 @@ if user["role"] == "admin":
                         st.rerun()
                     except Exception as exc:
                         st.error(f"删除失败：{exc}")
+
+    if page == "系统维护":
+        st.subheader("本机数据备份与恢复")
+        st.caption("完整备份包含数据库、原始文档和本地向量库。备份含账户密码哈希和私人内容，请妥善保存，不要上传到公开仓库。")
+        if st.button("生成完整备份", type="primary"):
+            try:
+                with st.spinner("正在检查数据库并打包本机数据，文件较多时需要等待……"):
+                    st.session_state.system_backup = rag.create_full_backup(user)
+                st.success("备份已生成，请下载并保存到安全位置。")
+            except Exception as exc:
+                st.error(f"备份失败：{exc}")
+        if st.session_state.get("system_backup"):
+            st.download_button(
+                "下载完整备份 ZIP", data=st.session_state.system_backup,
+                file_name=f"校务通_完整备份_{datetime.now():%Y%m%d_%H%M%S}.zip",
+                mime="application/zip",
+            )
+        with st.expander("从完整备份恢复（会替换当前数据）"):
+            st.warning("恢复会替换当前数据库、文档和向量库。系统会检查路径安全和数据库完整性，失败时尝试回滚；仍建议先下载一份当前备份。")
+            restore_file = st.file_uploader("选择校务通完整备份 ZIP", type=["zip"], key="restore_backup_file")
+            confirm_restore = st.checkbox("我确认用备份替换当前本机数据", key="confirm_restore_backup")
+            if st.button(
+                "开始恢复", disabled=not restore_file or not confirm_restore,
+                key="start_restore_backup",
+            ):
+                try:
+                    with st.spinner("正在校验并恢复备份……"):
+                        rag.restore_full_backup(user, restore_file.getvalue())
+                    get_rag.clear()
+                    st.session_state.clear()
+                    st.session_state.login_notice = "备份已恢复，请使用备份中的账户和新密码重新登录。"
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"恢复失败，现有数据已保留或已回滚：{exc}")
+
+        st.divider()
+        st.subheader("演示数据")
+        st.caption("只生成名称中带“【演示】”的课程、帖子和活动，不生成虚假的问答、使用量或评测成绩。可以随时单独清除，不影响其他数据。")
+        demo_status = rag.get_demo_data_status(user)
+        if demo_status["count"]:
+            st.warning(
+                f"当前有 {demo_status['count']} 条演示数据："
+                + "、".join(f"{item['name']} {item['count']} 条" for item in demo_status["items"])
+            )
+        else:
+            st.info("当前没有由系统创建的演示数据。")
+        demo_cols = st.columns(2)
+        if demo_cols[0].button(
+            "添加演示数据", use_container_width=True, disabled=bool(demo_status["count"])
+        ):
+            try:
+                created = rag.create_demo_data(user)
+                st.success(f"已添加 {created['count']} 条带“【演示】”标记的内容。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"添加失败：{exc}")
+        confirm_demo_clear = st.checkbox("确认只清除演示数据", key="confirm_demo_clear")
+        if demo_cols[1].button(
+            "一键清除演示数据", use_container_width=True,
+            disabled=not demo_status["count"] or not confirm_demo_clear,
+        ):
+            try:
+                removed = rag.clear_demo_data(user)
+                st.success(f"已清除 {removed} 条演示数据。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"清除失败：{exc}")
 
     if page == "自动诊断":
         st.subheader("权限与检索自动诊断")

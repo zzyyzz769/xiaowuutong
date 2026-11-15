@@ -7,13 +7,14 @@ import io
 import json
 import re
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import time
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from langchain_chroma import Chroma
@@ -388,6 +389,35 @@ class CampusRAG:
                     avg_latency_ms REAL NOT NULL,
                     details_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    link TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    read_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    username TEXT PRIMARY KEY,
+                    current_week INTEGER NOT NULL DEFAULT 1,
+                    semester TEXT NOT NULL DEFAULT '',
+                    period_times_json TEXT NOT NULL DEFAULT '{}',
+                    favorites_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    username TEXT PRIMARY KEY,
+                    failures INTEGER NOT NULL DEFAULT 0,
+                    locked_until TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS demo_items (
+                    table_name TEXT NOT NULL,
+                    record_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (table_name, record_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_audit_role
                     ON audit_logs(role, created_at);
                 CREATE INDEX IF NOT EXISTS idx_qa_user
@@ -401,23 +431,41 @@ class CampusRAG:
                 """
             )
 
-        # 老版本数据库原地升级，不清空历史问答。
+        # 老版本数据库原地升级，不清空历史问答、课表或社区数据。
         with self._connect() as conn:
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(qa_records)")}
-            additions = {
-                "confidence": "INTEGER NOT NULL DEFAULT 0",
-                "model": "TEXT NOT NULL DEFAULT ''",
-                "retrieval_mode": "TEXT NOT NULL DEFAULT 'hybrid'",
-                "feedback": "TEXT NOT NULL DEFAULT ''",
-                "feedback_at": "TEXT",
-                "rerank_used": "INTEGER NOT NULL DEFAULT 0",
-                "resolved_question": "TEXT NOT NULL DEFAULT ''",
-                "trust_score": "INTEGER NOT NULL DEFAULT 0",
-                "trust_explanation": "TEXT NOT NULL DEFAULT ''",
+            migrations = {
+                "qa_records": {
+                    "confidence": "INTEGER NOT NULL DEFAULT 0",
+                    "model": "TEXT NOT NULL DEFAULT ''",
+                    "retrieval_mode": "TEXT NOT NULL DEFAULT 'hybrid'",
+                    "feedback": "TEXT NOT NULL DEFAULT ''",
+                    "feedback_at": "TEXT",
+                    "rerank_used": "INTEGER NOT NULL DEFAULT 0",
+                    "resolved_question": "TEXT NOT NULL DEFAULT ''",
+                    "trust_score": "INTEGER NOT NULL DEFAULT 0",
+                    "trust_explanation": "TEXT NOT NULL DEFAULT ''",
+                    "latency_ms": "INTEGER NOT NULL DEFAULT 0",
+                },
+                "users": {
+                    "must_change_password": "INTEGER NOT NULL DEFAULT 0",
+                },
+                "schedule_entries": {
+                    "start_week": "INTEGER NOT NULL DEFAULT 1",
+                    "end_week": "INTEGER NOT NULL DEFAULT 53",
+                    "week_type": "TEXT NOT NULL DEFAULT 'all'",
+                    "semester": "TEXT NOT NULL DEFAULT ''",
+                    "start_section": "INTEGER NOT NULL DEFAULT 0",
+                    "end_section": "INTEGER NOT NULL DEFAULT 0",
+                },
             }
-            for name, definition in additions.items():
-                if name not in columns:
-                    conn.execute(f"ALTER TABLE qa_records ADD COLUMN {name} {definition}")
+            for table, additions in migrations.items():
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                for name, definition in additions.items():
+                    if name not in columns:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(username, created_at)"
+            )
 
         # 仅首次运行创建演示账户；修改密码后不会被覆盖。
         defaults = (
@@ -434,7 +482,8 @@ class CampusRAG:
                 salt, digest, iterations = self._hash_password(password)
                 with self._connect() as conn:
                     conn.execute(
-                        "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO users (username, role, salt, password_hash, iterations, created_at,"
+                        " must_change_password) VALUES (?, ?, ?, ?, ?, ?, 1)",
                         (username, role, salt, digest, iterations, self._now()),
                     )
 
@@ -462,9 +511,20 @@ class CampusRAG:
                 (self._now(), username, role, action, resource, detail[:2000]),
             )
 
-    def authenticate(self, username: str, password: str) -> dict[str, str] | None:
+    def authenticate(self, username: str, password: str) -> dict[str, Any] | None:
         username = username.strip()
+        now = datetime.now().astimezone()
         with self._connect() as conn:
+            attempt = conn.execute(
+                "SELECT * FROM login_attempts WHERE username=?", (username,)
+            ).fetchone()
+            if attempt and attempt["locked_until"]:
+                locked_until = datetime.fromisoformat(attempt["locked_until"])
+                if locked_until > now:
+                    seconds = max(1, int((locked_until - now).total_seconds()))
+                    raise ValueError(f"连续登录失败次数较多，请约 {max(1, seconds // 60 + 1)} 分钟后再试。")
+                # 锁定时间过去后重新计数，避免下一次输入错误又立即锁定。
+                attempt = None
             row = conn.execute(
                 "SELECT * FROM users WHERE username = ?", (username,)
             ).fetchone()
@@ -473,22 +533,45 @@ class CampusRAG:
         role = "unknown"
         if row:
             role = row["role"]
-            # 使用账户保存的迭代数重新计算，兼容未来调整。
             candidate = hashlib.pbkdf2_hmac(
-                "sha256",
-                password.encode("utf-8"),
-                bytes.fromhex(row["salt"]),
+                "sha256", password.encode("utf-8"), bytes.fromhex(row["salt"]),
                 int(row["iterations"]),
             ).hex()
             valid = hmac.compare_digest(candidate, row["password_hash"])
 
+        with self._connect() as conn:
+            if valid:
+                conn.execute("DELETE FROM login_attempts WHERE username=?", (username,))
+            else:
+                failures = int(attempt["failures"]) + 1 if attempt else 1
+                locked_until = (
+                    (now + timedelta(minutes=5)).isoformat(timespec="seconds")
+                    if failures >= 5 else ""
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO login_attempts (username, failures, locked_until, updated_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (username, failures, locked_until, now.isoformat(timespec="seconds")),
+                )
+
         self._audit(
-            username or "空用户名",
-            role,
+            username or "空用户名", role,
             "login_success" if valid else "login_failed",
             detail="本地账号密码登录",
         )
-        return {"username": username, "role": role} if valid else None
+        if not valid:
+            return None
+        default_passwords = {
+            "student": "Student@123", "counselor": "Counselor@123", "admin": "Admin@123",
+        }
+        must_change = bool(row["must_change_password"])
+        if password == default_passwords.get(username):
+            must_change = True
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE users SET must_change_password=1 WHERE username=?", (username,)
+                )
+        return {"username": username, "role": role, "must_change_password": must_change}
 
     def change_password(
         self, actor: dict[str, str], old_password: str, new_password: str
@@ -497,6 +580,8 @@ class CampusRAG:
         self._role(actor)
         if len(new_password) < 8:
             raise ValueError("新密码至少需要 8 个字符。")
+        if new_password == old_password:
+            raise ValueError("新密码不能与原密码相同。")
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM users WHERE username = ?", (username,)
@@ -514,8 +599,8 @@ class CampusRAG:
         salt, digest, iterations = self._hash_password(new_password)
         with self._connect() as conn:
             conn.execute(
-                "UPDATE users SET salt = ?, password_hash = ?, iterations = ?"
-                " WHERE username = ?",
+                "UPDATE users SET salt = ?, password_hash = ?, iterations = ?,"
+                " must_change_password = 0 WHERE username = ?",
                 (salt, digest, iterations, username),
             )
         self._audit(username, actor["role"], "change_password")
@@ -1340,6 +1425,7 @@ class CampusRAG:
         use_rerank: bool = False,
         history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        started_at = time.perf_counter()
         allowed = self._allowed_groups(actor)
         question = question.strip()
         if not question:
@@ -1446,14 +1532,16 @@ class CampusRAG:
 
         sources_json = json.dumps(sources, ensure_ascii=False)
         trust_score, trust_explanation = self._answer_trust(sources, confidence)
+        latency_ms = max(0, round((time.perf_counter() - started_at) * 1000))
         with self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO qa_records (created_at, username, role, question, answer,"
                 " sources_json, confidence, model, retrieval_mode, rerank_used, resolved_question,"
-                " trust_score, trust_explanation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " trust_score, trust_explanation, latency_ms)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (self._now(), actor["username"], actor["role"], question, answer,
                  sources_json, confidence, self.llm_model, retrieval_mode, int(use_rerank),
-                 resolved_question, trust_score, trust_explanation),
+                 resolved_question, trust_score, trust_explanation, latency_ms),
             )
             record_id = int(cursor.lastrowid)
         self._audit(
@@ -1473,6 +1561,7 @@ class CampusRAG:
             "resolved_question": resolved_question,
             "rerank_notice": rerank_notice,
             "generation_notice": generation_notice,
+            "latency_ms": latency_ms,
         }
 
     # ---------- 引导式事务办理 ----------
@@ -2186,6 +2275,57 @@ class CampusRAG:
         path.write_bytes(content)
         return str(path)
 
+    # ---------- 站内消息中心 ----------
+
+    def _notify(
+        self, username: str, kind: str, title: str, content: str, link: str = ""
+    ) -> None:
+        if not username or not title:
+            return
+        with self._connect() as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+                return
+            conn.execute(
+                "INSERT INTO notifications (username, kind, title, content, link, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (username, kind[:30], title[:120], content[:1000], link[:80], self._now()),
+            )
+
+    def get_notifications(self, actor: dict[str, str], limit: int = 100) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM notifications WHERE username=? ORDER BY id DESC LIMIT ?",
+                (actor["username"], max(1, min(int(limit), 200))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_unread_count(self, actor: dict[str, str]) -> int:
+        self._role(actor)
+        with self._connect() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM notifications WHERE username=? AND read_at IS NULL",
+                (actor["username"],),
+            ).fetchone()[0])
+
+    def mark_notification_read(self, actor: dict[str, str], notification_id: int) -> None:
+        self._role(actor)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE notifications SET read_at=? WHERE id=? AND username=?",
+                (self._now(), int(notification_id), actor["username"]),
+            )
+        if cursor.rowcount == 0:
+            raise PermissionError("只能处理自己的消息。")
+
+    def mark_all_notifications_read(self, actor: dict[str, str]) -> None:
+        self._role(actor)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE notifications SET read_at=? WHERE username=? AND read_at IS NULL",
+                (self._now(), actor["username"]),
+            )
+
     def list_user_directory(self, actor: dict[str, str]) -> list[dict[str, str]]:
         self._role(actor)
         with self._connect() as conn:
@@ -2262,13 +2402,16 @@ class CampusRAG:
         content = self._community_text(content, "评论", 1500)
         with self._connect() as conn:
             post = conn.execute(
-                "SELECT id FROM forum_posts WHERE id = ? AND status = 'visible'", (post_id,)
+                "SELECT id, username, title FROM forum_posts"
+                " WHERE id = ? AND status = 'visible'", (post_id,)
             ).fetchone()
             if not post:
                 raise ValueError("帖子不存在或暂不可评论。")
+            parent = None
             if parent_id is not None:
                 parent = conn.execute(
-                    "SELECT id FROM forum_comments WHERE id = ? AND post_id = ? AND status = 'visible'",
+                    "SELECT id, username FROM forum_comments"
+                    " WHERE id = ? AND post_id = ? AND status = 'visible'",
                     (parent_id, post_id),
                 ).fetchone()
                 if not parent:
@@ -2283,6 +2426,25 @@ class CampusRAG:
             )
             comment_id = int(cursor.lastrowid)
         self._audit(actor["username"], actor["role"], "forum_comment", str(comment_id), moderation["status"])
+        if moderation["status"] == "visible":
+            recipients = []
+            if parent and parent["username"] != actor["username"]:
+                recipients.append((parent["username"], f"{actor['username']} 回复了你的评论"))
+            if post["username"] != actor["username"] and (
+                not parent or post["username"] != parent["username"]
+            ):
+                recipients.append((post["username"], f"{actor['username']} 评论了你的帖子"))
+            for recipient, title in recipients:
+                self._notify(
+                    recipient, "评论", title,
+                    f"帖子《{post['title']}》：{content[:160]}",
+                    "校园社区|校园论坛",
+                )
+        else:
+            self._notify(
+                actor["username"], "审核", "评论已提交复核",
+                "通过复核后才会公开显示。", "消息中心",
+            )
         return {"id": comment_id, **moderation}
 
     def get_forum_comments(self, actor: dict[str, str], post_id: int) -> list[dict[str, Any]]:
@@ -2359,11 +2521,46 @@ class CampusRAG:
             raise ValueError("不支持的审核对象。")
         field, approved, rejected = settings[table]
         value = approved if approve else rejected
+        user_field = "sender" if table == "private_messages" else "username"
         with self._connect() as conn:
-            cursor = conn.execute(f"UPDATE {table} SET {field}=? WHERE id=?", (value, item_id))
-        if cursor.rowcount == 0:
-            raise ValueError("审核对象不存在。")
+            item = conn.execute(
+                f"SELECT id, {user_field} AS author, * FROM {table} WHERE id=?", (item_id,)
+            ).fetchone()
+            if not item:
+                raise ValueError("审核对象不存在。")
+            conn.execute(f"UPDATE {table} SET {field}=? WHERE id=?", (value, item_id))
         self._audit(actor["username"], actor["role"], "moderation_review", f"{table}/{item_id}", value)
+        kind_names = {
+            "forum_posts": "帖子", "forum_comments": "评论", "market_items": "二手商品",
+            "mood_posts": "树洞", "private_messages": "私信",
+        }
+        kind = kind_names[table]
+        if table == "private_messages":
+            if approve:
+                self._notify(
+                    item["author"], "审核", "私信复核已通过",
+                    "内容已送达收件人。", "校园社区|站内私信",
+                )
+                self._notify(
+                    item["recipient"], "私信", f"{item['author']} 发来一条私信",
+                    str(item["content"])[:160], "校园社区|站内私信",
+                )
+            else:
+                self._notify(
+                    item["author"], "审核", "私信复核未通过",
+                    "内容保持隐藏，未送达收件人。", "消息中心",
+                )
+        else:
+            links = {
+                "forum_posts": "校园社区|校园论坛", "forum_comments": "校园社区|校园论坛",
+                "market_items": "校园社区|二手交易", "mood_posts": "校园社区|心情树洞",
+            }
+            self._notify(
+                item["author"], "审核",
+                f"{kind}复核{'已通过' if approve else '未通过'}",
+                "内容现已公开展示。" if approve else "内容保持隐藏；如有疑问请联系管理员。",
+                links[table] if approve else "消息中心",
+            )
 
     # ---------- 失物招领、二手交易与站内私信 ----------
 
@@ -2503,6 +2700,16 @@ class CampusRAG:
             )
             message_id = int(cursor.lastrowid)
         self._audit(actor["username"], actor["role"], "private_message", str(message_id), moderation["status"])
+        if message_status == "delivered":
+            self._notify(
+                recipient, "私信", f"{actor['username']} 发来一条私信",
+                content[:160], "校园社区|站内私信",
+            )
+        else:
+            self._notify(
+                actor["username"], "审核", "私信已提交复核",
+                "通过复核后才会送达对方。", "消息中心",
+            )
         return {"id": message_id, **moderation}
 
     def get_private_messages(
@@ -2547,11 +2754,76 @@ class CampusRAG:
             raise ValueError(f"{label}必须使用 HH:MM 格式。") from exc
         return value
 
+    @staticmethod
+    def _validate_schedule_weeks(
+        start_week: int, end_week: int, week_type: str
+    ) -> tuple[int, int, str]:
+        start_week, end_week = int(start_week), int(end_week)
+        if not 1 <= start_week <= end_week <= 53:
+            raise ValueError("周次范围应在 1 到 53 之间，且结束周不能早于开始周。")
+        if week_type not in {"all", "odd", "even"}:
+            raise ValueError("单双周设置无效。")
+        return start_week, end_week, week_type
+
+    @staticmethod
+    def _schedule_week_matches(entry: dict[str, Any], week: int | None) -> bool:
+        if week is None:
+            return True
+        week = int(week)
+        if not int(entry.get("start_week", 1)) <= week <= int(entry.get("end_week", 53)):
+            return False
+        kind = entry.get("week_type", "all")
+        return kind == "all" or (kind == "odd" and week % 2 == 1) or (kind == "even" and week % 2 == 0)
+
     def add_schedule_entry(
         self, actor: dict[str, str], course_name: str, weekday: int,
         start_time: str, end_time: str, location: str = "", teacher: str = "",
+        start_week: int = 1, end_week: int = 53, week_type: str = "all",
+        semester: str = "", start_section: int = 0, end_section: int = 0,
     ) -> int:
         self._role(actor)
+        course_name = self._community_text(course_name, "课程名称", 100)
+        weekday = int(weekday)
+        if weekday not in range(1, 8):
+            raise ValueError("星期必须在 1 到 7 之间。")
+        start_time = self._valid_hhmm(start_time, "开始时间")
+        end_time = self._valid_hhmm(end_time, "结束时间")
+        if start_time >= end_time:
+            raise ValueError("结束时间必须晚于开始时间。")
+        start_week, end_week, week_type = self._validate_schedule_weeks(start_week, end_week, week_type)
+        start_section, end_section = int(start_section), int(end_section)
+        if start_section or end_section:
+            if not 1 <= start_section <= end_section <= 12:
+                raise ValueError("节次范围无效。")
+        location = self._community_text(location, "上课地点", 100, required=False)
+        teacher = self._community_text(teacher, "教师", 60, required=False)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO schedule_entries (username, course_name, weekday, start_time, end_time,"
+                " location, teacher, created_at, start_week, end_week, week_type, semester,"
+                " start_section, end_section) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (actor["username"], course_name, weekday, start_time, end_time,
+                 location, teacher, self._now(), start_week, end_week, week_type,
+                 semester.strip()[:40], start_section, end_section),
+            )
+            entry_id = int(cursor.lastrowid)
+        return entry_id
+
+    def update_schedule_entry(
+        self, actor: dict[str, str], entry_id: int, course_name: str, weekday: int,
+        start_time: str, end_time: str, location: str = "", teacher: str = "",
+        start_week: int = 1, end_week: int = 53, week_type: str = "all", semester: str = "",
+    ) -> None:
+        self._role(actor)
+        start_week, end_week, week_type = self._validate_schedule_weeks(start_week, end_week, week_type)
+        with self._connect() as conn:
+            owned = conn.execute(
+                "SELECT id FROM schedule_entries WHERE id=? AND username=?",
+                (int(entry_id), actor["username"]),
+            ).fetchone()
+        if not owned:
+            raise PermissionError("只能修改自己的课程。")
+        # 修改后不再保留旧节次标记，避免自定义作息再次覆盖用户手动设置的时间。
         course_name = self._community_text(course_name, "课程名称", 100)
         weekday = int(weekday)
         if weekday not in range(1, 8):
@@ -2563,14 +2835,101 @@ class CampusRAG:
         location = self._community_text(location, "上课地点", 100, required=False)
         teacher = self._community_text(teacher, "教师", 60, required=False)
         with self._connect() as conn:
-            cursor = conn.execute(
-                "INSERT INTO schedule_entries (username, course_name, weekday, start_time, end_time,"
-                " location, teacher, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (actor["username"], course_name, weekday, start_time, end_time,
-                 location, teacher, self._now()),
+            conn.execute(
+                "UPDATE schedule_entries SET course_name=?, weekday=?, start_time=?, end_time=?,"
+                " location=?, teacher=?, start_week=?, end_week=?, week_type=?, semester=?,"
+                " start_section=0, end_section=0 WHERE id=? AND username=?",
+                (course_name, weekday, start_time, end_time,
+                 location, teacher, start_week, end_week,
+                 week_type, semester.strip()[:40], int(entry_id), actor["username"]),
             )
-            entry_id = int(cursor.lastrowid)
-        return entry_id
+        self._audit(actor["username"], actor["role"], "schedule_update", str(entry_id))
+
+    def get_user_settings(self, actor: dict[str, str]) -> dict[str, Any]:
+        self._role(actor)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM user_settings WHERE username=?", (actor["username"],)
+            ).fetchone()
+        default_periods = {
+            str(section): list(self._schedule_section_times((section, section)))
+            for section in range(1, 13)
+        }
+        if not row:
+            return {
+                "current_week": 1, "semester": "", "period_times": default_periods,
+                "favorites": [],
+            }
+        try:
+            saved_periods = json.loads(row["period_times_json"] or "{}")
+        except json.JSONDecodeError:
+            saved_periods = {}
+        for section, value in saved_periods.items():
+            if section in default_periods and isinstance(value, list) and len(value) == 2:
+                default_periods[section] = value
+        try:
+            favorites = json.loads(row["favorites_json"] or "[]")
+        except json.JSONDecodeError:
+            favorites = []
+        return {
+            "current_week": int(row["current_week"]), "semester": row["semester"],
+            "period_times": default_periods,
+            "favorites": [str(item) for item in favorites if isinstance(item, str)],
+        }
+
+    def update_schedule_settings(
+        self, actor: dict[str, str], current_week: int, semester: str,
+        period_times: dict[str, list[str]],
+    ) -> None:
+        self._role(actor)
+        current_week = int(current_week)
+        if not 1 <= current_week <= 53:
+            raise ValueError("当前周应在 1 到 53 之间。")
+        normalized: dict[str, list[str]] = {}
+        for section in range(1, 13):
+            value = period_times.get(str(section), [])
+            if len(value) != 2:
+                raise ValueError(f"第 {section} 节缺少起止时间。")
+            start = self._valid_hhmm(value[0], f"第 {section} 节开始时间")
+            end = self._valid_hhmm(value[1], f"第 {section} 节结束时间")
+            if start >= end:
+                raise ValueError(f"第 {section} 节结束时间必须晚于开始时间。")
+            normalized[str(section)] = [start, end]
+        old = self.get_user_settings(actor)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO user_settings"
+                " (username, current_week, semester, period_times_json, favorites_json)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (actor["username"], current_week, semester.strip()[:40],
+                 json.dumps(normalized, ensure_ascii=False),
+                 json.dumps(old.get("favorites", []), ensure_ascii=False)),
+            )
+            rows = conn.execute(
+                "SELECT id, start_section, end_section FROM schedule_entries"
+                " WHERE username=? AND start_section>0", (actor["username"],)
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE schedule_entries SET start_time=?, end_time=? WHERE id=?",
+                    (normalized[str(row["start_section"])][0],
+                     normalized[str(row["end_section"])][1], row["id"]),
+                )
+        self._audit(actor["username"], actor["role"], "schedule_settings", str(current_week))
+
+    def set_favorites(self, actor: dict[str, str], favorites: list[str]) -> None:
+        self._role(actor)
+        allowed = {"教务问答", "办事向导", "校园社区", "校园服务", "消息中心"}
+        cleaned = [item for item in favorites if item in allowed][:5]
+        settings = self.get_user_settings(actor)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO user_settings"
+                " (username, current_week, semester, period_times_json, favorites_json)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (actor["username"], settings["current_week"], settings["semester"],
+                 json.dumps(settings["period_times"], ensure_ascii=False), json.dumps(cleaned)),
+            )
 
     @staticmethod
     def _schedule_day(value: Any) -> int | None:
@@ -2604,12 +2963,67 @@ class CampusRAG:
         return result
 
     @staticmethod
+    def _schedule_sections(text: Any, allow_bare: bool = False) -> tuple[int, int] | None:
+        """识别“第1—2节”“(5-6节)”及节次列中的独立数字。"""
+        compact = re.sub(r"\s+", "", str(text or ""))
+        match = re.search(r"(?:第)?(\d{1,2})\s*[-—–~至]\s*(\d{1,2})节", compact)
+        if match:
+            start, end = int(match.group(1)), int(match.group(2))
+        else:
+            single = re.search(r"第(\d{1,2})节", compact)
+            if single:
+                start = end = int(single.group(1))
+            elif allow_bare:
+                bare = re.fullmatch(r"(\d{1,2})(?:[-—–~至](\d{1,2}))?", compact)
+                if not bare:
+                    return None
+                start = int(bare.group(1))
+                end = int(bare.group(2) or start)
+            else:
+                return None
+        if not (1 <= start <= end <= 12):
+            return None
+        return start, end
+
+    @staticmethod
+    def _schedule_section_times(sections: tuple[int, int]) -> tuple[str, str]:
+        """把节次转成通用参考时间；不代表任何学校的官方作息。"""
+        reference = {
+            1: ("08:00", "08:45"), 2: ("08:55", "09:40"),
+            3: ("10:00", "10:45"), 4: ("10:55", "11:40"),
+            5: ("14:00", "14:45"), 6: ("14:55", "15:40"),
+            7: ("16:00", "16:45"), 8: ("16:55", "17:40"),
+            9: ("19:00", "19:45"), 10: ("19:55", "20:40"),
+            11: ("20:50", "21:35"), 12: ("21:45", "22:30"),
+        }
+        return reference[sections[0]][0], reference[sections[1]][1]
+
+    @staticmethod
+    def _schedule_week_details(text: Any) -> tuple[int, int, str]:
+        """读取课程单元格中的周次范围和单双周，未写时按全周处理。"""
+        compact = re.sub(r"\s+", "", str(text or ""))
+        start_week, end_week = 1, 53
+        match = re.search(r"(?<!\d)(\d{1,2})\s*[-—–~至]\s*(\d{1,2})周", compact)
+        if match:
+            start_week, end_week = int(match.group(1)), int(match.group(2))
+            if not 1 <= start_week <= end_week <= 53:
+                start_week, end_week = 1, 53
+        week_type = "all"
+        if "单周" in compact or re.search(r"[（(]单[）)]", compact):
+            week_type = "odd"
+        elif "双周" in compact or re.search(r"[（(]双[）)]", compact):
+            week_type = "even"
+        return start_week, end_week, week_type
+
+    @staticmethod
     def _schedule_course_name(value: Any) -> str:
         text = re.sub(r"\s+", " ", str(value or "")).strip()
         text = re.sub(r"^(?:课程名称|课程名|课程)\s*[:：]", "", text)
         text = re.sub(r"(?:星期|周)[一二三四五六日天1-7]", " ", text)
         text = re.sub(r"第\s*\d+\s*[-—–~至]\s*\d+\s*周", " ", text)
+        text = re.sub(r"[（(]?\s*\d+\s*[-—–~至]\s*\d+\s*节\s*[）)]?", " ", text)
         text = re.sub(r"(?:单周|双周|周次\s*[:：]?\s*[\d\-—–~至]+)", " ", text)
+        text = re.sub(r"[★☆*]+", "", text)
         text = re.sub(r"^\d+\s+(?=[\u4e00-\u9fffA-Za-z])", "", text)
         text = text.strip(" |｜,，;；-—–")
         if not 2 <= len(text) <= 100 or text in {"课程", "课程名称", "课程名", "无", "暂无"}:
@@ -2620,28 +3034,31 @@ class CampusRAG:
 
     @classmethod
     def _schedule_cell_details(cls, content: Any) -> tuple[str, str, str]:
-        """从周视图单元格提取课程、地点和教师；不确定的可选字段留空。"""
-        lines = [re.sub(r"\s+", " ", line).strip() for line in re.split(r"[\n\r]+", str(content or "")) if line.strip()]
-        teacher = ""
-        location = ""
-        course = ""
-        for line in lines:
-            compact = line.strip()
-            if not teacher and re.search(r"教师|老师|教授|讲师", compact):
-                candidate = re.sub(r"^(?:任课)?(?:教师|老师)\s*[:：]?", "", compact).strip()
-                teacher = candidate[:60]
+        """从周视图单元格提取完整课程名、地点和教师，可选字段不确定时留空。"""
+        raw = str(content or "")
+        compact_all = re.sub(r"\s+", "", raw)
+        teacher_match = re.search(r"(?:教师|老师)[:：]([^/；;]+)", compact_all)
+        location_match = re.search(r"(?:场地|地点|教室)[:：]([^/；;]+)", compact_all)
+        teacher = teacher_match.group(1)[:60].strip() if teacher_match else ""
+        location = location_match.group(1)[:100].strip() if location_match else ""
+
+        name_lines: list[str] = []
+        for line in re.split(r"[\n\r]+", raw):
+            compact = re.sub(r"\s+", " ", line).strip()
+            if not compact or re.fullmatch(r"[★☆*\s]+", compact):
                 continue
-            if not location and (
-                re.search(r"教室|教学楼|实验楼|图书馆|体育馆|活动中心|中心|[A-Za-z]\d{3,4}", compact)
-            ):
-                location = compact[:100]
+            section = re.search(r"[（(]?\s*\d+\s*[-—–~至]\s*\d+\s*节", compact)
+            if section:
+                prefix = compact[:section.start()].strip(" ★☆*")
+                if prefix:
+                    name_lines.append(prefix)
+                break
+            if re.search(r"周/|校区|场地|教师|老师|教学班|考核方式|选课备注|周学时|总学时|学分", compact):
+                break
+            if len(cls._schedule_times(compact)) >= 2:
                 continue
-            if re.search(r"第\s*\d+\s*[-—–~至]?\s*\d*\s*周|单周|双周|周次", compact):
-                continue
-            if cls._schedule_times(compact) and len(cls._schedule_times(compact)) >= 2:
-                continue
-            if not course:
-                course = cls._schedule_course_name(compact)
+            name_lines.append(compact)
+        course = cls._schedule_course_name("".join(name_lines))
         return course, location, teacher
 
     def _parse_schedule_table(
@@ -2664,13 +3081,18 @@ class CampusRAG:
                     return index
             return None
 
+        # 按行排列：课程、星期、时间或节次分别位于不同列。
         for header_index, headers in enumerate(rows):
             course_col = find_column(headers, ("课程名称", "课程名", "课程"))
             day_col = find_column(headers, ("上课星期", "星期几", "星期"))
             start_col = find_column(headers, ("开始时间", "起始时间", "上课开始"))
             end_col = find_column(headers, ("结束时间", "截止时间", "下课时间"))
             time_col = find_column(headers, ("上课时间", "节次时间", "时间"))
-            if course_col is None or day_col is None or (time_col is None and (start_col is None or end_col is None)):
+            section_col = find_column(headers, ("上课节次", "节次", "节数"))
+            if course_col is None or day_col is None or (
+                time_col is None and section_col is None
+                and (start_col is None or end_col is None)
+            ):
                 continue
             location_col = find_column(headers, ("上课地点", "教室", "地点"))
             teacher_col = find_column(headers, ("任课教师", "教师", "老师"))
@@ -2688,48 +3110,88 @@ class CampusRAG:
                     if start_col is not None and end_col is not None else cell(time_col)
                 )
                 times = self._schedule_times(time_text)
-                if not course or not last_day or len(times) < 2:
+                sections = self._schedule_sections(time_text)
+                if not sections and section_col is not None:
+                    sections = self._schedule_sections(cell(section_col), allow_bare=True)
+                if not course or not last_day or (len(times) < 2 and not sections):
                     if any(row):
-                        errors.append(f"第 {page_number} 页表格 {table_number} 第 {row_index} 行：缺少课程名、星期或具体起止时间。")
+                        errors.append(
+                            f"第 {page_number} 页表格 {table_number} 第 {row_index} 行："
+                            "缺少课程名、星期、具体起止时间或节次。"
+                        )
                     continue
+                if len(times) >= 2:
+                    start_time, end_time = times[0][2], times[1][2]
+                    time_source, section_range = "exact", ""
+                else:
+                    start_time, end_time = self._schedule_section_times(sections)
+                    time_source = "section"
+                    section_range = f"{sections[0]}—{sections[1]}"
                 entries.append({
                     "course_name": course, "weekday": last_day,
-                    "start_time": times[0][2], "end_time": times[1][2],
+                    "start_time": start_time, "end_time": end_time,
                     "location": cell(location_col)[:100], "teacher": cell(teacher_col)[:60],
-                    "source_page": page_number,
+                    "source_page": page_number, "time_source": time_source,
+                    "section_range": section_range,
+                    "start_section": sections[0] if time_source == "section" and sections else 0,
+                    "end_section": sections[1] if time_source == "section" and sections else 0,
                 })
             return entries, errors
 
-        # 周视图：表头包含至少两个“星期X”，每行第一列给出具体时间。
+        # 周视图：星期按列排列，时间可位于时间段列，也可只提供节次。
         for header_index, headers in enumerate(rows):
             day_columns = [(index, self._schedule_day(cell)) for index, cell in enumerate(headers)]
             day_columns = [(index, day) for index, day in day_columns if day]
             if len(day_columns) < 2:
                 continue
+            time_col = find_column(headers, ("上课时间", "节次时间", "时间段", "时间"))
+            period_col = find_column(headers, ("上课节次", "节次", "节数"))
             last_times: list[tuple[int, int, str]] = []
             for row_index, row in enumerate(rows[header_index + 1:], start=header_index + 2):
-                first_cell = row[0] if row else ""
-                row_times = self._schedule_times(first_cell)
+                def cell(index: int | None) -> str:
+                    return row[index] if index is not None and index < len(row) else ""
+
+                time_text = cell(time_col) if time_col is not None else cell(0)
+                row_times = self._schedule_times(time_text)
                 if len(row_times) >= 2:
                     last_times = row_times[:2]
-                elif first_cell:
+                elif row_times:
                     last_times = []
+                period_text = cell(period_col)
                 for column, day in day_columns:
-                    content = row[column] if column < len(row) else ""
+                    content = cell(column)
                     if not content.strip():
                         continue
                     course, location, teacher = self._schedule_cell_details(content)
                     if not course:
                         continue
-                    if len(last_times) < 2:
-                        message = f"第 {page_number} 页表格 {table_number} 第 {row_index} 行：{course} 缺少具体起止时间。"
-                        if message not in errors:
-                            errors.append(message)
-                        continue
+                    start_week, end_week, week_type = self._schedule_week_details(content)
+                    if len(last_times) >= 2:
+                        start_time, end_time = last_times[0][2], last_times[1][2]
+                        time_source, section_range = "exact", ""
+                    else:
+                        sections = self._schedule_sections(content)
+                        if not sections:
+                            sections = self._schedule_sections(period_text, allow_bare=True)
+                        if not sections:
+                            message = (
+                                f"第 {page_number} 页表格 {table_number} 第 {row_index} 行："
+                                f"{course} 缺少具体起止时间或节次。"
+                            )
+                            if message not in errors:
+                                errors.append(message)
+                            continue
+                        start_time, end_time = self._schedule_section_times(sections)
+                        time_source = "section"
+                        section_range = f"{sections[0]}—{sections[1]}"
                     entries.append({
                         "course_name": course, "weekday": day,
-                        "start_time": last_times[0][2], "end_time": last_times[1][2],
+                        "start_time": start_time, "end_time": end_time,
                         "location": location, "teacher": teacher, "source_page": page_number,
+                        "time_source": time_source, "section_range": section_range,
+                        "start_section": sections[0] if time_source == "section" and sections else 0,
+                        "end_section": sections[1] if time_source == "section" and sections else 0,
+                        "start_week": start_week, "end_week": end_week, "week_type": week_type,
                     })
             return entries, errors
         return [], []
@@ -2873,8 +3335,13 @@ class CampusRAG:
         if len(result_entries) > 500:
             result_entries = result_entries[:500]
             warnings.append("最多预览 500 条课程，其余课程未处理。")
+        if any(entry.get("time_source") == "section" for entry in result_entries):
+            warnings.append(
+                "部分课程只有节次，已按通用节次表填入参考时间，并在预览中保留原始节次。"
+                "这些时间不是学校官方作息，用于提醒前请自行核对。"
+            )
         if not result_entries:
-            warnings.append("没有识别出完整课程。PDF 需包含课程名、星期和具体起止时间；也可以下载 CSV 模板整理后导入。")
+            warnings.append("没有识别出完整课程。PDF 需包含课程名、星期，以及具体起止时间或节次；也可以下载 CSV 模板整理后导入。")
         return {
             "entries": result_entries, "errors": errors[:100], "warnings": list(dict.fromkeys(warnings)),
             "pages": page_count, "text_pages": text_pages, "ocr_pages": ocr_pages,
@@ -2905,6 +3372,10 @@ class CampusRAG:
                 self.add_schedule_entry(
                     actor, course, day, start, end,
                     str(entry.get("location", "") or ""), str(entry.get("teacher", "") or ""),
+                    int(entry.get("start_week", 1) or 1), int(entry.get("end_week", 53) or 53),
+                    str(entry.get("week_type", "all") or "all"),
+                    str(entry.get("semester", "") or ""),
+                    int(entry.get("start_section", 0) or 0), int(entry.get("end_section", 0) or 0),
                 )
                 existing.add(key)
                 success += 1
@@ -2938,26 +3409,37 @@ class CampusRAG:
         reader = csv.DictReader(io.StringIO(text))
         required = {"课程", "星期", "开始时间", "结束时间"}
         if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-            raise ValueError("CSV 表头必须包含：课程、星期、开始时间、结束时间；地点和教师可选。")
-        success = 0
+            raise ValueError("CSV 表头必须包含：课程、星期、开始时间、结束时间；其他高级字段可选。")
+        entries = []
         errors = []
+        week_types = {"": "all", "全部": "all", "每周": "all", "单周": "odd", "双周": "even"}
         for index, row in enumerate(reader, start=2):
-            if index > 502:
+            if index > 501:
                 errors.append("最多导入 500 条课程，其余行未处理。")
                 break
             try:
-                self.add_schedule_entry(
-                    actor, row.get("课程", ""), int(str(row.get("星期", "")).strip()),
-                    row.get("开始时间", ""), row.get("结束时间", ""),
-                    row.get("地点", "") or "", row.get("教师", "") or "",
-                )
-                success += 1
+                week_label = str(row.get("单双周", "") or "").strip()
+                if week_label not in week_types:
+                    raise ValueError("单双周只能填写：每周、单周或双周。")
+                entries.append({
+                    "course_name": row.get("课程", ""), "weekday": row.get("星期", ""),
+                    "start_time": row.get("开始时间", ""), "end_time": row.get("结束时间", ""),
+                    "location": row.get("地点", "") or "", "teacher": row.get("教师", "") or "",
+                    "start_week": row.get("开始周", "") or 1,
+                    "end_week": row.get("结束周", "") or 53,
+                    "week_type": week_types[week_label], "semester": row.get("学期", "") or "",
+                    "start_section": row.get("开始节次", "") or 0,
+                    "end_section": row.get("结束节次", "") or 0,
+                })
             except Exception as exc:
                 errors.append(f"第 {index} 行：{exc}")
-        self._audit(actor["username"], actor["role"], "schedule_import", detail=f"成功 {success}，失败 {len(errors)}")
-        return {"success": success, "errors": errors}
+        result = self.import_schedule_entries(actor, entries, source="CSV")
+        result["errors"] = errors + result["errors"]
+        return result
 
-    def get_schedule(self, actor: dict[str, str], weekday: int | None = None) -> list[dict[str, Any]]:
+    def get_schedule(
+        self, actor: dict[str, str], weekday: int | None = None, week: int | None = None
+    ) -> list[dict[str, Any]]:
         self._role(actor)
         sql = "SELECT * FROM schedule_entries WHERE username=?"
         params: list[Any] = [actor["username"]]
@@ -2967,7 +3449,7 @@ class CampusRAG:
         sql += " ORDER BY weekday, start_time, id"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [dict(row) for row in rows]
+        return [dict(row) for row in rows if self._schedule_week_matches(dict(row), week)]
 
     def delete_schedule_entry(self, actor: dict[str, str], entry_id: int) -> None:
         self._role(actor)
@@ -2978,12 +3460,38 @@ class CampusRAG:
         if cursor.rowcount == 0:
             raise PermissionError("只能删除自己的课程。")
 
+    def clear_schedule(self, actor: dict[str, str]) -> int:
+        self._role(actor)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM schedule_entries WHERE username=?", (actor["username"],)
+            )
+        count = max(0, cursor.rowcount)
+        self._audit(actor["username"], actor["role"], "schedule_clear", detail=f"删除 {count} 条")
+        return count
+
+    def get_schedule_conflicts(self, actor: dict[str, str], week: int | None = None) -> list[dict[str, Any]]:
+        entries = self.get_schedule(actor, week=week)
+        conflicts = []
+        for index, first in enumerate(entries):
+            for second in entries[index + 1:]:
+                if first["weekday"] != second["weekday"]:
+                    continue
+                if first["start_time"] < second["end_time"] and first["end_time"] > second["start_time"]:
+                    conflicts.append({
+                        "weekday": first["weekday"], "first": first["course_name"],
+                        "second": second["course_name"],
+                        "time": f"{max(first['start_time'], second['start_time'])}—{min(first['end_time'], second['end_time'])}",
+                    })
+        return conflicts
+
     def get_upcoming_classes(self, actor: dict[str, str]) -> list[dict[str, Any]]:
         now = datetime.now()
         today = now.isoweekday()
         current = now.strftime("%H:%M")
+        current_week = self.get_user_settings(actor)["current_week"]
         result = []
-        for entry in self.get_schedule(actor, today):
+        for entry in self.get_schedule(actor, today, week=current_week):
             if entry["start_time"] >= current:
                 start_dt = datetime.strptime(entry["start_time"], "%H:%M").replace(
                     year=now.year, month=now.month, day=now.day
@@ -3001,11 +3509,13 @@ class CampusRAG:
             raise ValueError("结束时间必须晚于开始时间。")
         if int(weekday) not in range(1, 8):
             raise ValueError("星期无效。")
+        current_week = self.get_user_settings(actor)["current_week"]
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT location, start_time, end_time FROM schedule_entries"
-                " WHERE weekday=? AND location != ''", (int(weekday),)
+                "SELECT location, start_time, end_time, start_week, end_week, week_type"
+                " FROM schedule_entries WHERE weekday=? AND location != ''", (int(weekday),)
             ).fetchall()
+        rows = [row for row in rows if self._schedule_week_matches(dict(row), current_week)]
         rooms = sorted({row["location"] for row in rows})
         occupied = sorted({
             row["location"] for row in rows
@@ -3079,6 +3589,11 @@ class CampusRAG:
             except sqlite3.IntegrityError as exc:
                 raise ValueError("你已经报名过该活动。") from exc
         self._audit(actor["username"], actor["role"], "activity_enroll", str(activity_id))
+        self._notify(
+            actor["username"], "活动", f"报名成功：{activity['title']}",
+            f"时间：{activity['starts_at']}；地点：{activity['location'] or '待定'}。",
+            "校园服务|活动报名",
+        )
 
     def cancel_activity_enrollment(self, actor: dict[str, str], activity_id: int) -> None:
         self._role(actor)
@@ -3255,6 +3770,282 @@ class CampusRAG:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    # ---------- 演示数据、个人导出与完整备份 ----------
+
+    def get_demo_data_status(self, actor: dict[str, str]) -> dict[str, Any]:
+        self._require_admin(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT table_name, COUNT(*) AS count FROM demo_items GROUP BY table_name"
+            ).fetchall()
+        names = {"schedule_entries": "演示课程", "forum_posts": "演示帖子", "activities": "演示活动"}
+        items = [{"name": names.get(row["table_name"], row["table_name"]),
+                  "count": int(row["count"])} for row in rows]
+        return {"count": sum(item["count"] for item in items), "items": items}
+
+    def create_demo_data(self, actor: dict[str, str]) -> dict[str, Any]:
+        """只添加带“演示”标记的可追踪内容，不生成虚假的问答或指标。"""
+        self._require_admin(actor)
+        if self.get_demo_data_status(actor)["count"]:
+            raise ValueError("演示数据已经存在；如需重新生成，请先清除现有演示数据。")
+        tracked: list[tuple[str, int]] = []
+
+        def track(table: str, record_id: int) -> None:
+            tracked.append((table, record_id))
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO demo_items (table_name, record_id, created_at) VALUES (?, ?, ?)",
+                    (table, record_id, self._now()),
+                )
+
+        try:
+            demos = [
+                ("【演示】高等数学", 1, "08:00", "09:40", "演示教学楼 A101", "演示教师", 1, 2),
+                ("【演示】大学英语", 3, "10:00", "11:40", "演示教学楼 B203", "演示教师", 3, 4),
+                ("【演示】程序设计基础", 5, "14:00", "15:40", "演示机房 C305", "演示教师", 1, 2),
+            ]
+            for course, day, start, end, room, teacher, first, last in demos:
+                entry_id = self.add_schedule_entry(
+                    actor, course, day, start, end, room, teacher,
+                    start_week=1, end_week=16, week_type="all", semester="演示学期",
+                    start_section=first, end_section=last,
+                )
+                track("schedule_entries", entry_id)
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO forum_posts (username, role, category, title, content, image_path,"
+                    " status, moderation_reason, created_at) VALUES (?, ?, '校园生活', ?, ?, '',"
+                    " 'visible', '演示数据', ?)",
+                    (actor["username"], actor["role"], "【演示】欢迎使用校园论坛",
+                     "这是一条用于展示页面效果的演示帖子，不代表真实校园通知，可以随时一键清除。",
+                     self._now()),
+                )
+                post_id = int(cursor.lastrowid)
+            track("forum_posts", post_id)
+            start = datetime.now() + timedelta(days=7)
+            activity_id = self.create_activity(
+                actor, "【演示】校园讲座", "仅用于演示活动报名，不是真实活动安排。",
+                "演示活动中心", start.isoformat(timespec="minutes"),
+                (start + timedelta(hours=2)).isoformat(timespec="minutes"), 50,
+            )
+            track("activities", activity_id)
+        except Exception:
+            self.clear_demo_data(actor)
+            raise
+        self._audit(actor["username"], actor["role"], "demo_create", detail=f"{len(tracked)} 条")
+        return {"count": len(tracked), "schedule": 3, "posts": 1, "activities": 1}
+
+    def clear_demo_data(self, actor: dict[str, str]) -> int:
+        """按白名单和精确记录编号删除演示内容，不触碰其他个人数据。"""
+        self._require_admin(actor)
+        with self._connect() as conn:
+            rows = conn.execute("SELECT table_name, record_id FROM demo_items").fetchall()
+        allowed = {"schedule_entries", "forum_posts", "activities"}
+        count = 0
+        with self._connect() as conn:
+            for row in rows:
+                table = row["table_name"]
+                if table not in allowed:
+                    continue
+                item_id = int(row["record_id"])
+                if table == "forum_posts":
+                    conn.execute(
+                        "DELETE FROM forum_reactions WHERE target_type='post' AND target_id=?", (item_id,)
+                    )
+                    conn.execute("DELETE FROM forum_comments WHERE post_id=?", (item_id,))
+                elif table == "activities":
+                    conn.execute("DELETE FROM activity_enrollments WHERE activity_id=?", (item_id,))
+                cursor = conn.execute(f"DELETE FROM {table} WHERE id=?", (item_id,))
+                count += max(0, cursor.rowcount)
+            conn.execute("DELETE FROM demo_items")
+        self._audit(actor["username"], actor["role"], "demo_clear", detail=f"删除 {count} 条")
+        return count
+
+    def export_personal_data(self, actor: dict[str, str]) -> bytes:
+        """导出当前账户自己的课表、问答和活动报名记录。"""
+        self._role(actor)
+        username = actor["username"]
+        with self._connect() as conn:
+            schedule = conn.execute(
+                "SELECT * FROM schedule_entries WHERE username=? ORDER BY weekday, start_time, id",
+                (username,),
+            ).fetchall()
+            activities = conn.execute(
+                "SELECT a.title, a.starts_at, a.ends_at, a.location, a.status, e.created_at"
+                " FROM activity_enrollments e JOIN activities a ON a.id=e.activity_id"
+                " WHERE e.username=? ORDER BY e.created_at", (username,),
+            ).fetchall()
+
+        def make_csv(headers: list[str], rows: list[list[Any]]) -> bytes:
+            output = io.StringIO(newline="")
+            writer = csv.writer(output)
+            writer.writerow(headers)
+            for row in rows:
+                writer.writerow([self._csv_safe(value) for value in row])
+            return output.getvalue().encode("utf-8-sig")
+
+        week_names = {"all": "每周", "odd": "单周", "even": "双周"}
+        schedule_csv = make_csv(
+            ["课程", "星期", "开始时间", "结束时间", "地点", "教师", "开始周", "结束周",
+             "单双周", "学期", "开始节次", "结束节次"],
+            [[row["course_name"], row["weekday"], row["start_time"], row["end_time"],
+              row["location"], row["teacher"], row["start_week"], row["end_week"],
+              week_names.get(row["week_type"], row["week_type"]), row["semester"],
+              row["start_section"] or "", row["end_section"] or ""] for row in schedule],
+        )
+        activity_csv = make_csv(
+            ["活动", "开始时间", "结束时间", "地点", "活动状态", "报名时间"],
+            [[row["title"], row["starts_at"], row["ends_at"], row["location"],
+              row["status"], row["created_at"]] for row in activities],
+        )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("我的课表.csv", schedule_csv)
+            archive.writestr("我的问答.csv", self.export_qa_csv(actor))
+            archive.writestr("我的活动报名.csv", activity_csv)
+            archive.writestr(
+                "导出说明.txt",
+                "本文件仅包含当前登录账户自己的课表、问答和活动报名记录。\n"
+                "CSV 已防止表格公式注入，问答内容含当前账户的零宽溯源水印。\n",
+            )
+        self._audit(username, actor["role"], "export_personal_data",
+                    detail=f"课表 {len(schedule)} 条，活动 {len(activities)} 条")
+        return buffer.getvalue()
+
+    def create_full_backup(self, actor: dict[str, str]) -> bytes:
+        """管理员完整备份：一致性 SQLite 副本、原始资料和本地向量库。"""
+        self._require_admin(actor)
+        buffer = io.BytesIO()
+        with tempfile.TemporaryDirectory(prefix="campus_backup_") as temp:
+            db_copy = Path(temp) / "campus_system.db"
+            with self._connect() as source, sqlite3.connect(db_copy) as target:
+                source.backup(target)
+            with sqlite3.connect(db_copy) as check:
+                if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise ValueError("数据库完整性检查未通过，已停止备份。")
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+                archive.writestr("manifest.json", json.dumps({
+                    "format": "xiaowutong-local-backup", "version": 1, "created_at": self._now(),
+                }, ensure_ascii=False, indent=2))
+                archive.write(db_copy, "campus_system.db")
+                for root, archive_root in (
+                    (self.data_dir, "data"), (self.db_dir, "chroma_db")
+                ):
+                    if not root.exists():
+                        continue
+                    for path in root.rglob("*"):
+                        if path.is_symlink():
+                            raise ValueError(f"备份目录包含符号链接，已停止：{path.name}")
+                        if path.is_file():
+                            archive.write(path, f"{archive_root}/{path.relative_to(root).as_posix()}")
+        self._audit(actor["username"], actor["role"], "backup_create")
+        return buffer.getvalue()
+
+    def restore_full_backup(self, actor: dict[str, str], content: bytes) -> None:
+        """校验后恢复完整备份；任何替换失败都会尝试回滚到恢复前状态。"""
+        self._require_admin(actor)
+        if len(content) > 1024 * 1024 * 1024:
+            raise ValueError("备份文件不能超过 1 GB。")
+        temp_root = Path(tempfile.mkdtemp(
+            prefix=".campus_restore_", dir=str(self.system_db.parent.resolve())
+        ))
+        stage = temp_root / "stage"
+        rollback = temp_root / "rollback"
+        stage.mkdir()
+        rollback.mkdir()
+        try:
+            try:
+                archive = zipfile.ZipFile(io.BytesIO(content))
+            except zipfile.BadZipFile as exc:
+                raise ValueError("这不是有效的 ZIP 备份文件。") from exc
+            with archive:
+                members = [item for item in archive.infolist() if not item.is_dir()]
+                if len(members) > 200000 or sum(item.file_size for item in members) > 2 * 1024**3:
+                    raise ValueError("备份内文件过多或解压后超过 2 GB。")
+                for item in members:
+                    name = item.filename
+                    path = PurePosixPath(name)
+                    if (
+                        "\\" in name or name.startswith("/") or ".." in path.parts
+                        or not name or any(ord(char) < 32 for char in name)
+                        or ((item.external_attr >> 16) & 0o170000) == 0o120000
+                    ):
+                        raise ValueError(f"备份包含不安全路径：{name}")
+                    allowed = (
+                        name in {"campus_system.db", "manifest.json"}
+                        or name.startswith("data/") or name.startswith("chroma_db/")
+                    )
+                    if not allowed:
+                        raise ValueError(f"备份包含不允许的内容：{name}")
+                    target = stage.joinpath(*path.parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(item) as source, target.open("wb") as destination:
+                        shutil.copyfileobj(source, destination)
+            restored_db = stage / "campus_system.db"
+            if not restored_db.exists():
+                raise ValueError("备份缺少 campus_system.db。")
+            with sqlite3.connect(restored_db) as conn:
+                if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise ValueError("备份数据库损坏，未修改现有数据。")
+                try:
+                    admin_row = conn.execute(
+                        "SELECT role FROM users WHERE username=?", (actor["username"],)
+                    ).fetchone()
+                except sqlite3.DatabaseError as exc:
+                    raise ValueError("备份缺少有效的用户表。") from exc
+            if not admin_row or admin_row[0] != "admin":
+                raise ValueError("备份中必须保留当前管理员账户，避免恢复后无法登录。")
+
+            targets = (self.system_db, self.data_dir, self.db_dir)
+            stage_sources = {
+                self.system_db: stage / "campus_system.db",
+                self.data_dir: stage / "data",
+                self.db_dir: stage / "chroma_db",
+            }
+            for target in targets:
+                saved = rollback / target.name
+                if target.exists():
+                    if target.is_dir():
+                        shutil.copytree(target, saved)
+                    else:
+                        shutil.copy2(target, saved)
+            self._vectorstores.clear()
+            self._chunk_cache.clear()
+            self._bm25_cache.clear()
+            try:
+                for target in targets:
+                    source = stage_sources[target]
+                    if target.exists():
+                        if target.is_dir():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+                    if source.exists():
+                        if source.is_dir():
+                            shutil.copytree(source, target)
+                        else:
+                            shutil.copy2(source, target)
+                    elif target != self.system_db:
+                        target.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                for target in targets:
+                    saved = rollback / target.name
+                    if target.exists():
+                        if target.is_dir():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+                    if saved.exists():
+                        if saved.is_dir():
+                            shutil.copytree(saved, target)
+                        else:
+                            shutil.copy2(saved, target)
+                raise
+            self._init_system_db()
+            self._audit(actor["username"], actor["role"], "backup_restore")
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
     # ---------- 历史、CSV 与审计查询 ----------
 
     def get_qa_records(self, actor: dict[str, str], limit: int = 30) -> list[dict[str, Any]]:
@@ -3281,6 +4072,7 @@ class CampusRAG:
                 "rerank_used": bool(row["rerank_used"]),
                 "feedback": row["feedback"],
                 "feedback_at": row["feedback_at"],
+                "latency_ms": int(row["latency_ms"] or 0),
             })
         return records
 
@@ -3324,7 +4116,7 @@ class CampusRAG:
         writer = csv.writer(output)
         writer.writerow([
             "时间", "用户名", "角色", "问题", "回答", "置信度",
-            "模型", "检索模式", "Rerank", "反馈", "原文来源",
+            "模型", "检索模式", "Rerank", "反馈", "实际耗时（毫秒）", "原文来源",
         ])
         for row in rows:
             sources = json.loads(row["sources_json"])
@@ -3340,7 +4132,8 @@ class CampusRAG:
                     ROLE_NAMES.get(row["role"], row["role"]),
                     row["question"], row["answer"] + self._watermark(actor["username"]),
                     row["confidence"], row["model"], row["retrieval_mode"],
-                    "是" if row["rerank_used"] else "否", row["feedback"], source_text,
+                    "是" if row["rerank_used"] else "否", row["feedback"],
+                    int(row["latency_ms"] or 0), source_text,
                 )
             ])
         self._audit(actor["username"], actor["role"], "export_qa_csv", detail=f"{len(rows)} 条")
@@ -3372,13 +4165,13 @@ class CampusRAG:
         with self._connect() as conn:
             if role == "admin":
                 rows = conn.execute(
-                    "SELECT created_at, question, resolved_question, sources_json, trust_score, feedback"
+                    "SELECT created_at, question, resolved_question, sources_json, trust_score, feedback, latency_ms"
                     " FROM qa_records WHERE created_at >= ? ORDER BY id DESC LIMIT 5000",
                     (since,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT created_at, question, resolved_question, sources_json, trust_score, feedback"
+                    "SELECT created_at, question, resolved_question, sources_json, trust_score, feedback, latency_ms"
                     " FROM qa_records WHERE created_at >= ? AND username = ?"
                     " ORDER BY id DESC LIMIT 5000",
                     (since, actor["username"]),
@@ -3391,6 +4184,7 @@ class CampusRAG:
         source_usage: dict[str, dict[str, Any]] = {}
         feedback_counts = {"useful": 0, "useless": 0, "unrated": 0}
         trust_values = []
+        latency_values = []
         answered = 0
         allowed = set(self._allowed_groups(actor))
         for row in rows:
@@ -3409,6 +4203,8 @@ class CampusRAG:
                 hourly[str(int(created[11:13]))] += 1
             feedback = row["feedback"] if row["feedback"] in {"useful", "useless"} else "unrated"
             feedback_counts[feedback] += 1
+            if int(row["latency_ms"] or 0) > 0:
+                latency_values.append(int(row["latency_ms"]))
             if sources:
                 answered += 1
                 trust_values.append(int(row["trust_score"] or 0))
@@ -3443,6 +4239,10 @@ class CampusRAG:
             "unanswered": len(rows) - answered,
             "answer_rate": answered / len(rows) if rows else 0,
             "average_trust": round(sum(trust_values) / len(trust_values)) if trust_values else 0,
+            "average_latency_ms": (
+                round(sum(latency_values) / len(latency_values)) if latency_values else 0
+            ),
+            "latency_count": len(latency_values),
             "hot_questions": sorted(hot.values(), key=lambda item: item["count"], reverse=True)[:10],
             "unanswered_questions": unanswered[:20],
             "daily_counts": daily_counts,
